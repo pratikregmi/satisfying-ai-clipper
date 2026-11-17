@@ -331,7 +331,11 @@ def calculate_overlap_ratio(
 def rank_video_moments(
     db: Session,
     video_id: int,
-    max_results: int = 100,
+    max_results: int = 10,
+    video_duration: float | None = None,
+    temporal_buckets: int = 8,
+    overlap_threshold: float = 0.50,
+    minimum_score: float = 45.0,
 ) -> dict:
     candidates = list(
         db.scalars(
@@ -349,8 +353,17 @@ def rank_video_moments(
             "video_id": video_id,
             "total_candidates": 0,
             "ranked_candidates": 0,
+            "selected_count": 0,
             "selected_candidates": [],
         }
+
+    if video_duration is None or video_duration <= 0:
+        video_duration = max(
+            candidate.end_time for candidate in candidates
+        )
+
+    temporal_buckets = max(1, temporal_buckets)
+    video_duration = max(video_duration, 0.001)
 
     scored_candidates = []
 
@@ -367,13 +380,89 @@ def rank_video_moments(
             candidate.duration
         )
 
-        overall_score = round(
+        preliminary_score = (
             dialogue_score * 0.40
             + visual_score * 0.30
             + emotion_score * 0.20
-            + duration_score * 0.10,
-            2,
+            + duration_score * 0.10
         )
+
+        preliminary_score = round(preliminary_score, 2)
+
+        # Read the saved Qwen evaluation without changing the database.
+        try:
+            evidence = (
+                json.loads(candidate.evidence or "{}")
+                if isinstance(candidate.evidence, str)
+                else candidate.evidence or {}
+            )
+        except (json.JSONDecodeError, TypeError):
+            evidence = {}
+
+        ai_evaluation = (
+            evidence.get("ai_evaluation", {})
+            if isinstance(evidence, dict)
+            else {}
+        )
+
+        ai_overall = candidate.overall_score
+
+        if ai_overall is None:
+            ai_overall = ai_evaluation.get("overall_score")
+
+        ai_confidence = candidate.confidence
+
+        if ai_confidence is None:
+            ai_confidence = ai_evaluation.get("confidence")
+
+        completeness_score = ai_evaluation.get(
+            "completeness_score"
+        )
+
+        is_evaluated = ai_overall is not None
+
+        if is_evaluated:
+            ai_overall = float(ai_overall)
+
+            confidence = (
+                max(0.0, min(float(ai_confidence or 0), 100.0))
+                / 100.0
+            )
+
+            # Give completeness a smaller contribution than the
+            # overall AI evaluation.
+            if completeness_score is not None:
+                ai_quality_score = (
+                    ai_overall * 0.85
+                    + float(completeness_score) * 0.15
+                )
+            else:
+                ai_quality_score = ai_overall
+
+            # Low-confidence AI evaluations have less influence.
+            ai_weight = 0.70 * confidence
+
+            final_score = (
+                preliminary_score * (1 - ai_weight)
+                + ai_quality_score * ai_weight
+            )
+
+        else:
+            confidence = 0.0
+            final_score = preliminary_score
+
+        final_score = round(final_score, 2)
+
+        midpoint = (
+            candidate.start_time + candidate.end_time
+        ) / 2
+
+        bucket_index = min(
+            int(midpoint / video_duration * temporal_buckets),
+            temporal_buckets - 1,
+        )
+
+        bucket_index = max(0, bucket_index)
 
         scored_candidates.append({
             "candidate": candidate,
@@ -381,40 +470,92 @@ def rank_video_moments(
             "visual_score": visual_score,
             "emotion_score": emotion_score,
             "duration_score": duration_score,
-            "overall_score": overall_score,
+            "preliminary_score": preliminary_score,
+            "ai_overall_score": ai_overall,
+            "ai_confidence": round(confidence * 100, 2),
+            "ai_evaluated": is_evaluated,
+            "final_score": final_score,
+            "temporal_bucket": bucket_index,
         })
 
-    scored_candidates.sort(
-        key=lambda item: item["overall_score"],
-        reverse=True,
-    )
+    # Remove candidates below the minimum quality threshold.
+    eligible_candidates = [
+        item
+        for item in scored_candidates
+        if item["final_score"] >= minimum_score
+    ]
+
+    buckets = {
+        index: []
+        for index in range(temporal_buckets)
+    }
+
+    for item in eligible_candidates:
+        buckets[item["temporal_bucket"]].append(item)
+
+    for bucket in buckets.values():
+        bucket.sort(
+            key=lambda item: item["final_score"],
+            reverse=True,
+        )
 
     selected = []
 
-    for item in scored_candidates:
-        candidate = item["candidate"]
+    bucket_positions = {
+        index: 0
+        for index in range(temporal_buckets)
+    }
 
-        is_duplicate = any(
-            calculate_overlap_ratio(
-                candidate,
-                selected_item["candidate"],
-            ) >= 0.80
-            for selected_item in selected
-        )
+    # Select high-quality candidates while spreading them
+    # across the video's timeline.
+    while len(selected) < max_results:
+        made_progress = False
 
-        if is_duplicate:
-            continue
+        for bucket_index in range(temporal_buckets):
+            if len(selected) >= max_results:
+                break
 
-        selected.append(item)
+            bucket_candidates = buckets[bucket_index]
+            position = bucket_positions[bucket_index]
 
-        if len(selected) >= max_results:
+            while position < len(bucket_candidates):
+                item = bucket_candidates[position]
+                candidate = item["candidate"]
+
+                position += 1
+
+                is_duplicate = any(
+                    calculate_overlap_ratio(
+                        candidate,
+                        selected_item["candidate"],
+                    ) >= overlap_threshold
+                    for selected_item in selected
+                )
+
+                if is_duplicate:
+                    continue
+
+                selected.append(item)
+                made_progress = True
+                break
+
+            bucket_positions[bucket_index] = position
+
+        if not made_progress:
             break
 
     return {
         "video_id": video_id,
         "total_candidates": len(candidates),
         "ranked_candidates": len(scored_candidates),
+        "eligible_candidates": len(eligible_candidates),
         "selected_count": len(selected),
+        "temporal_buckets": temporal_buckets,
+        "overlap_threshold": overlap_threshold,
+        "minimum_score": minimum_score,
+        "ai_evaluated_count": sum(
+            1 for item in selected if item["ai_evaluated"]
+        ),
         "selected_candidates": [
             {
                 "id": item["candidate"].id,
@@ -422,11 +563,16 @@ def rank_video_moments(
                 "start_time": item["candidate"].start_time,
                 "end_time": item["candidate"].end_time,
                 "duration": item["candidate"].duration,
+                "preliminary_score": item["preliminary_score"],
+                "ai_overall_score": item["ai_overall_score"],
+                "ai_confidence": item["ai_confidence"],
+                "ai_evaluated": item["ai_evaluated"],
+                "final_score": item["final_score"],
                 "dialogue_score": item["dialogue_score"],
                 "visual_score": item["visual_score"],
                 "emotion_score": item["emotion_score"],
                 "duration_score": item["duration_score"],
-                "overall_score": item["overall_score"],
+                "temporal_bucket": item["temporal_bucket"],
             }
             for item in selected
         ],

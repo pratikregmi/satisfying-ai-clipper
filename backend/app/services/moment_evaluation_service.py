@@ -262,3 +262,79 @@ Candidate evidence:
         "model_name": MODEL_NAME,
         "saved": True,
     }
+
+
+def evaluate_moment_candidates_batch(
+    db: Session,
+    candidate_ids: list[int],
+    batch_size: int = 3,
+) -> dict:
+    """
+    Evaluate a limited number of candidates sequentially.
+
+    Already evaluated candidates are skipped.
+    Each successful evaluation is committed by
+    evaluate_moment_candidate().
+    Failed candidates do not stop the remaining batch.
+    """
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
+
+    results = {
+        "requested": len(candidate_ids),
+        "processed": 0,
+        "evaluated": [],
+        "skipped": [],
+        "failed": [],
+    }
+
+    # Process only the requested batch size.
+    for candidate_id in candidate_ids[:batch_size]:
+        candidate = db.get(MomentCandidate, candidate_id)
+
+        if candidate is None:
+            results["failed"].append({
+                "candidate_id": candidate_id,
+                "error": "Candidate not found.",
+            })
+            continue
+
+        # Check whether an AI evaluation was already saved.
+        try:
+            stored_evidence = json.loads(candidate.evidence or "{}")
+        except (json.JSONDecodeError, TypeError):
+            stored_evidence = {}
+
+        already_evaluated = (
+            isinstance(stored_evidence.get("ai_evaluation"), dict)
+            or candidate.overall_score is not None
+        )
+
+        if already_evaluated:
+            results["skipped"].append(candidate_id)
+            continue
+
+        try:
+            evaluation_result = evaluate_moment_candidate(
+                db,
+                candidate_id,
+            )
+
+            results["evaluated"].append(evaluation_result)
+
+        except Exception as error:
+            db.rollback()
+
+            results["failed"].append({
+                "candidate_id": candidate_id,
+                "error": str(error),
+            })
+
+        results["processed"] += 1
+
+    results["evaluated_count"] = len(results["evaluated"])
+    results["skipped_count"] = len(results["skipped"])
+    results["failed_count"] = len(results["failed"])
+
+    return results

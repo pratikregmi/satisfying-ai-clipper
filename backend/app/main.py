@@ -28,6 +28,9 @@ from backend.app.api.scene_analysis_jobs import (
     router as scene_analysis_jobs_router,
 )
 from backend.app.models.moment_candidate import MomentCandidate
+from backend.app.models.pipeline_job import PipelineJob
+from backend.app.api.pipeline import router as pipeline_router
+
 from backend.app.api.moment_discovery import (
     router as moment_discovery_router,
 )
@@ -48,6 +51,7 @@ app.include_router(scene_analysis_router)
 app.include_router(scene_batch_router)
 app.include_router(scene_analysis_jobs_router)
 app.include_router(moment_discovery_router)
+app.include_router(pipeline_router)
 
 @app.get("/")
 def home():

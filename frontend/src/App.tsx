@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import "./App.css";
 
-const VIDEO_ID = 2;
 const PAGE_SIZE = 50;
 
 type Video = {
@@ -51,6 +50,25 @@ type SceneTranscriptPage = {
   }[];
 };
 
+type GeneratedClipFile = {
+  filename: string;
+  url: string;
+  size_bytes: number;
+};
+
+type GeneratedClip = {
+  candidate_id: number;
+  review: GeneratedClipFile | null;
+  shorts: GeneratedClipFile | null;
+  full: GeneratedClipFile | null;
+};
+
+type GeneratedClipsResponse = {
+  video_id: number;
+  total: number;
+  clips: GeneratedClip[];
+};
+
 function formatTime(seconds: number) {
   const safeSeconds = Math.max(0, Math.floor(seconds));
   const hours = Math.floor(safeSeconds / 3600);
@@ -75,7 +93,10 @@ function formatSize(bytes: number) {
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [video, setVideo] = useState<Video | null>(null);
+  const [videos, setVideos] = useState<Video[]>([]);
+  const [selectedVideoId, setSelectedVideoId] = useState<number | null>(null);
+  const video = videos.find((item) => item.id === selectedVideoId) ?? null;
+
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [selectedScenes, setSelectedScenes] = useState<number[]>([]);
   const [currentScene, setCurrentScene] = useState<Scene | null>(null);
@@ -84,22 +105,38 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const loadVideo = useCallback(async () => {
-    const response = await fetch(`/api/videos/${VIDEO_ID}`);
+  const [clips, setClips] = useState<GeneratedClip[]>([]);
+  const [clipLoading, setClipLoading] = useState(false);
+  const [clipError, setClipError] = useState("");
+
+  const loadVideos = useCallback(async () => {
+    const response = await fetch("/api/videos/");
+
     if (!response.ok) {
-      throw new Error("Could not load video information.");
+      throw new Error("Could not load your video library.");
     }
-    const data = await response.json();
-    setVideo(data);
+
+    const data: Video[] = await response.json();
+    setVideos(data);
+
+    if (data.length > 0) {
+      const preferredVideo = data.find((item) => item.id === 2) ?? data[0];
+      setSelectedVideoId(preferredVideo.id);
+    } else {
+      setLoading(false);
+    }
   }, []);
 
-  const loadScenes = useCallback(async (pageOffset: number) => {
+  const loadScenes = useCallback(async (
+    videoId: number,
+    pageOffset: number
+  ) => {
     setLoading(true);
     setError("");
 
     try {
       const response = await fetch(
-        `/api/videos/${VIDEO_ID}/scene-transcripts?limit=${PAGE_SIZE}&offset=${pageOffset}`
+        `/api/videos/${videoId}/scene-transcripts?limit=${PAGE_SIZE}&offset=${pageOffset}`
       );
 
       if (!response.ok) {
@@ -123,6 +160,8 @@ function App() {
       setTotalScenes(data.total_scenes);
       setOffset(data.offset);
     } catch (err) {
+      setScenes([]);
+      setTotalScenes(0);
       setError(
         err instanceof Error ? err.message : "Something went wrong."
       );
@@ -131,14 +170,57 @@ function App() {
     }
   }, []);
 
-  useEffect(() => {
-    loadVideo().catch((err) => {
-      setError(
-        err instanceof Error ? err.message : "Could not load video."
+  const loadClips = useCallback(async (videoId: number) => {
+    setClipLoading(true);
+    setClipError("");
+
+    try {
+      const response = await fetch(`/api/videos/${videoId}/clips`);
+
+      if (!response.ok) {
+        throw new Error("Could not load generated clips.");
+      }
+
+      const data: GeneratedClipsResponse = await response.json();
+      setClips(data.clips ?? []);
+    } catch (err) {
+      setClips([]);
+      setClipError(
+        err instanceof Error ? err.message : "Could not load generated clips."
       );
+    } finally {
+      setClipLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadVideos().catch((err) => {
+      setError(
+        err instanceof Error ? err.message : "Could not load video library."
+      );
+      setLoading(false);
     });
-    loadScenes(0);
-  }, [loadVideo, loadScenes]);
+  }, [loadVideos]);
+
+  useEffect(() => {
+    if (selectedVideoId === null) return;
+
+    setSelectedScenes([]);
+    setCurrentScene(null);
+    setOffset(0);
+    setTotalScenes(0);
+
+    loadScenes(selectedVideoId, 0);
+  }, [selectedVideoId, loadScenes]);
+
+  useEffect(() => {
+    if (selectedVideoId === null) {
+      setClips([]);
+      return;
+    }
+
+    loadClips(selectedVideoId);
+  }, [selectedVideoId, loadClips]);
 
   const selectScene = (scene: Scene) => {
     setCurrentScene(scene);
@@ -226,7 +308,25 @@ function App() {
               <h3>{video?.original_filename || "Loading video..."}</h3>
               <p>Review your video and explore its detected scenes.</p>
             </div>
-            <div className="video-tag">VIDEO #{VIDEO_ID}</div>
+            <div className="video-controls">
+              <label className="video-selector">
+                <span>SELECT VIDEO</span>
+                <select
+                  value={selectedVideoId ?? ""}
+                  onChange={(event) => setSelectedVideoId(Number(event.target.value))}
+                  disabled={videos.length === 0}
+                >
+                  {videos.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      #{item.id} · {item.original_filename}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="video-tag">
+                VIDEO #{selectedVideoId ?? "—"}
+              </div>
+            </div>
           </div>
 
           <div className="video-layout">
@@ -236,7 +336,7 @@ function App() {
                   ref={videoRef}
                   controls
                   preload="metadata"
-                  src={`/api/videos/${VIDEO_ID}/stream`}
+                  src={selectedVideoId !== null ? `/api/videos/${selectedVideoId}/stream` : undefined}
                 />
               </div>
               <div className="player-footer">
@@ -292,6 +392,110 @@ function App() {
               </div>
             </div>
           </div>
+        </section>
+
+        <section className="clips-section">
+          <div className="section-heading">
+            <div>
+              <div className="eyebrow">YOUR GENERATED OUTPUTS</div>
+              <h3>Generated Clips</h3>
+              <p>Preview and download your review clips and finished outputs.</p>
+            </div>
+            <div className="video-tag">
+              {clips.length} {clips.length === 1 ? "CANDIDATE" : "CANDIDATES"}
+            </div>
+          </div>
+
+          {clipLoading ? (
+            <div className="loading-state">Loading generated clips...</div>
+          ) : clipError ? (
+            <div className="loading-state">{clipError}</div>
+          ) : clips.length === 0 ? (
+            <div className="loading-state">
+              No generated clips for this video yet. Generated outputs will
+              appear here after the pipeline finishes.
+            </div>
+          ) : (
+            <div className="clips-grid">
+              {clips.map((clip) => {
+                const output = clip.shorts ?? clip.full;
+                const outputLabel = clip.shorts
+                  ? "YouTube Shorts · 9:16"
+                  : clip.full
+                    ? "Full-screen output"
+                    : "Output not generated";
+
+                return (
+                  <article className="clip-card" key={clip.candidate_id}>
+                    <div className="clip-card-heading">
+                      <strong>Candidate #{clip.candidate_id}</strong>
+                      <span>{outputLabel}</span>
+                    </div>
+
+                    <div className="clip-pair">
+                      {clip.review && (
+                        <div className="clip-media">
+                          <div className="clip-media-heading">
+                            <strong>Review clip</strong>
+                            <span>{formatSize(clip.review.size_bytes)}</span>
+                          </div>
+                          <div className="clip-video-frame">
+                            <video
+                              controls
+                              preload="metadata"
+                              src={clip.review.url}
+                            />
+                          </div>
+                          <a
+                            className="clip-download"
+                            href={clip.review.url}
+                            download={clip.review.filename}
+                          >
+                            Download review clip ↓
+                          </a>
+                        </div>
+                      )}
+
+                      {output && (
+                        <div className="clip-media">
+                          <div className="clip-media-heading">
+                            <strong>
+                              {clip.shorts ? "YouTube Shorts" : "Full-screen"}
+                            </strong>
+                            <span>{formatSize(output.size_bytes)}</span>
+                          </div>
+                          <div
+                            className={`clip-video-frame ${
+                              clip.shorts ? "vertical" : ""
+                            }`}
+                          >
+                            <video
+                              controls
+                              preload="metadata"
+                              src={output.url}
+                            />
+                          </div>
+                          <a
+                            className="clip-download"
+                            href={output.url}
+                            download={output.filename}
+                          >
+                            Download finished clip ↓
+                          </a>
+                        </div>
+                      )}
+
+                      {!output && (
+                        <div className="clip-output-pending">
+                          The finished output has not been generated yet.
+                        </div>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
         </section>
 
         <section className="scenes-section">
@@ -409,7 +613,7 @@ function App() {
           <div className="pagination">
             <button
               disabled={currentPage <= 1 || loading}
-              onClick={() => loadScenes(Math.max(0, offset - PAGE_SIZE))}
+              onClick={() => selectedVideoId !== null && loadScenes(selectedVideoId, Math.max(0, offset - PAGE_SIZE))}
             >
               ← Previous
             </button>
@@ -418,7 +622,7 @@ function App() {
             </span>
             <button
               disabled={currentPage >= totalPages || loading}
-              onClick={() => loadScenes(offset + PAGE_SIZE)}
+              onClick={() => selectedVideoId !== null && loadScenes(selectedVideoId, offset + PAGE_SIZE)}
             >
               Next →
             </button>

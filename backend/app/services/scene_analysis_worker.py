@@ -8,6 +8,16 @@ from backend.app.core.database import SessionLocal
 from backend.app.models.scene import Scene
 from backend.app.models.scene_analysis import SceneAnalysis
 from backend.app.services.scene_batch_service import process_scene_batch
+from backend.app.services.video_storage_service import get_video_logger
+
+
+def _log_video_event(video_id: int, level: str, message: str) -> None:
+    try:
+        logger = get_video_logger(video_id)
+        getattr(logger, level)(message)
+    except Exception:
+        # Logging must never interrupt a background analysis job.
+        pass
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +48,12 @@ def run_scene_analysis_job(
         job["status"] = "running"
 
     try:
+        _log_video_event(
+            video_id,
+            "info",
+            f"Background scene analysis job started | Batch size: {batch_size}",
+        )
+
         while True:
             db = SessionLocal()
 
@@ -110,6 +126,19 @@ def run_scene_analysis_job(
             video_id,
         )
 
+        with _jobs_lock:
+            final_job = dict(_active_jobs[video_id])
+
+        _log_video_event(
+            video_id,
+            "warning" if final_job["status"] == "completed_with_errors" else "info",
+            "Background scene analysis job finished | "
+            f"Status: {final_job['status']} | "
+            f"Analyzed: {final_job['analyzed']} | "
+            f"Failed: {final_job['failed']} | "
+            f"Remaining: {final_job['remaining']}",
+        )
+
     except Exception as error:
         logger.exception(
             "Scene analysis job failed for video %s",
@@ -119,6 +148,12 @@ def run_scene_analysis_job(
         with _jobs_lock:
             _active_jobs[video_id]["status"] = "failed"
             _active_jobs[video_id]["error"] = str(error)
+
+        _log_video_event(
+            video_id,
+            "error",
+            f"Background scene analysis job failed | Error: {error}",
+        )
 
     finally:
         with _jobs_lock:

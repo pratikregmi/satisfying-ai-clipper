@@ -36,3 +36,14 @@ logs/
 !.vscode/extensions.json
 .idea/
 .DS_Store
+# Local logs and project backups
+logs.txt
+backups/
+*.bak
+*.backup
+*.before-*
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3

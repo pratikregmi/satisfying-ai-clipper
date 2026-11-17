@@ -1,6 +1,4 @@
-
 import json
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -10,6 +8,14 @@ from backend.app.models.scene import Scene
 from backend.app.models.video import Video
 from backend.app.models.scene_analysis import SceneAnalysis
 from backend.app.services.scene_analysis_service import analyze_scene_image
+from backend.app.services.video_storage_service import (
+    get_video_storage_paths,
+    resolve_video_storage_path,
+    get_video_logger,
+)
+from backend.app.services.video_results_service import (
+    refresh_video_results,
+)
 
 
 router = APIRouter(
@@ -17,8 +23,40 @@ router = APIRouter(
     tags=["AI Scene Analysis"],
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-THUMBNAIL_DIR = (PROJECT_ROOT / "media" / "thumbnails").resolve()
+
+def _get_scene_thumbnail_path(
+    video_id: int,
+    stored_path: str,
+):
+    expected_directory = (
+        get_video_storage_paths(video_id)["scene_thumbnails"]
+        .resolve()
+    )
+
+    try:
+        thumbnail_path = resolve_video_storage_path(
+            video_id,
+            stored_path,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid scene thumbnail path: {error}",
+        ) from error
+
+    if not thumbnail_path.is_relative_to(expected_directory):
+        raise HTTPException(
+            status_code=400,
+            detail="Scene thumbnail is outside this video's storage folder.",
+        )
+
+    if not thumbnail_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Scene thumbnail file is missing.",
+        )
+
+    return thumbnail_path
 
 
 def serialize_analysis(analysis: SceneAnalysis) -> dict:
@@ -63,21 +101,10 @@ def analyze_single_scene(
             detail="Scene thumbnail has not been generated.",
         )
 
-    thumbnail_path = (
-        PROJECT_ROOT / scene.thumbnail_path
-    ).resolve()
-
-    if not thumbnail_path.is_relative_to(THUMBNAIL_DIR):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid scene thumbnail path.",
-        )
-
-    if not thumbnail_path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Scene thumbnail file is missing.",
-        )
+    thumbnail_path = _get_scene_thumbnail_path(
+        video_id,
+        scene.thumbnail_path,
+    )
 
     try:
         result = analyze_scene_image(thumbnail_path)
@@ -112,6 +139,36 @@ def analyze_single_scene(
 
         db.commit()
         db.refresh(analysis)
+
+        try:
+            logger = get_video_logger(video_id)
+            logger.info(
+                "Manual scene analysis completed | "
+                f"Scene ID: {scene_id} | "
+                f"Scene number: {scene.scene_number}"
+            )
+
+            export_result = refresh_video_results(
+                db,
+                video_id,
+            )
+
+            logger.info(
+                "Results refreshed after manual scene analysis | "
+                f"Files: {export_result['exported_count']}"
+            )
+
+        except Exception as export_error:
+            # The analysis is already committed. An export failure
+            # must not report the successful analysis as failed.
+            try:
+                get_video_logger(video_id).error(
+                    "Manual scene analysis results export failed | "
+                    f"Scene ID: {scene_id} | "
+                    f"Error: {export_error}"
+                )
+            except Exception:
+                pass
 
         return {
             "status": "completed",

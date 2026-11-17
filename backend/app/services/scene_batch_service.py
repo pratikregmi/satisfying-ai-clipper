@@ -1,13 +1,28 @@
-
 import json
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.app.core.database import PROJECT_ROOT
 from backend.app.models.scene import Scene
 from backend.app.models.scene_analysis import SceneAnalysis
 from backend.app.services.scene_analysis_service import analyze_scene_image
+from backend.app.services.video_storage_service import (
+    get_video_storage_paths,
+    resolve_video_storage_path,
+    get_video_logger,
+)
+from backend.app.services.video_results_service import (
+    refresh_video_results,
+)
+
+
+def _log_video_event(video_id: int, level: str, message: str) -> None:
+    try:
+        logger = get_video_logger(video_id)
+        getattr(logger, level)(message)
+    except Exception:
+        # Logging must never undo a saved analysis.
+        pass
 
 
 def process_scene_batch(
@@ -21,6 +36,7 @@ def process_scene_batch(
 
     Successful analyses are committed immediately.
     Failed scene IDs can be excluded during an automatic run.
+    Scene thumbnails must belong to this video's storage directory.
     """
 
     if not 1 <= batch_size <= 20:
@@ -51,9 +67,10 @@ def process_scene_batch(
     completed = 0
     failed = []
 
-    thumbnail_root = (
-        PROJECT_ROOT / "media" / "thumbnails"
-    ).resolve()
+    expected_thumbnail_directory = (
+        get_video_storage_paths(video_id)["scene_thumbnails"]
+        .resolve()
+    )
 
     for scene in scenes:
         scene_id = scene.id
@@ -65,13 +82,16 @@ def process_scene_batch(
                     "Scene thumbnail path is missing."
                 )
 
-            image_path = (
-                PROJECT_ROOT / scene.thumbnail_path
-            ).resolve()
+            image_path = resolve_video_storage_path(
+                video_id,
+                scene.thumbnail_path,
+            )
 
-            if not image_path.is_relative_to(thumbnail_root):
+            if not image_path.is_relative_to(
+                expected_thumbnail_directory
+            ):
                 raise ValueError(
-                    "Invalid scene thumbnail path."
+                    "Scene thumbnail does not belong to this video's scene-thumbnail folder."
                 )
 
             if not image_path.is_file():
@@ -98,6 +118,14 @@ def process_scene_batch(
 
             completed += 1
 
+            _log_video_event(
+                video_id,
+                "info",
+                "Batch scene analysis completed | "
+                f"Scene ID: {scene_id} | "
+                f"Scene number: {scene_number}",
+            )
+
         except Exception as error:
             db.rollback()
 
@@ -106,6 +134,15 @@ def process_scene_batch(
                 "scene_number": scene_number,
                 "error": str(error),
             })
+
+            _log_video_event(
+                video_id,
+                "warning",
+                "Batch scene analysis failed | "
+                f"Scene ID: {scene_id} | "
+                f"Scene number: {scene_number} | "
+                f"Error: {error}",
+            )
 
     total = db.query(Scene).filter(
         Scene.video_id == video_id
@@ -119,6 +156,25 @@ def process_scene_batch(
     ).count()
 
     remaining = total - analyzed
+
+    # Refresh this video's exports after the batch. Export failures must
+    # not undo analyses that have already been committed.
+    try:
+        export_result = refresh_video_results(db, video_id)
+
+        _log_video_event(
+            video_id,
+            "info",
+            "Batch results export completed | "
+            f"Files: {export_result['exported_count']}",
+        )
+    except Exception as error:
+        _log_video_event(
+            video_id,
+            "error",
+            "Batch results export failed | "
+            f"Error: {error}",
+        )
 
     return {
         "video_id": video_id,

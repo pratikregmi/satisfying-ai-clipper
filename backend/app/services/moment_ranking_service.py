@@ -336,15 +336,23 @@ def rank_video_moments(
     temporal_buckets: int = 8,
     overlap_threshold: float = 0.50,
     minimum_score: float = 45.0,
+    candidate_ids: list[int] | None = None,
 ) -> dict:
+    candidate_query = select(MomentCandidate).where(
+        MomentCandidate.video_id == video_id,
+        MomentCandidate.status == "pending",
+    )
+
+    if candidate_ids is not None:
+        candidate_query = candidate_query.where(
+            MomentCandidate.id.in_(candidate_ids)
+        )
+
     candidates = list(
         db.scalars(
-            select(MomentCandidate)
-            .where(
-                MomentCandidate.video_id == video_id,
-                MomentCandidate.status == "pending",
+            candidate_query.order_by(
+                MomentCandidate.start_time.asc()
             )
-            .order_by(MomentCandidate.start_time.asc())
         ).all()
     )
 

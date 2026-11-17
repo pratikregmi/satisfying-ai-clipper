@@ -32,12 +32,12 @@ The current frontend is a scene browser; clip editing, vertical exports, subtitl
 - FFmpeg, including `ffprobe`, available on your `PATH`
 - Ollama for visual scene analysis
 
-The backend dependency file (`backend/requirements.txt`) is currently empty. Install the Python packages used by the application directly:
+Install the backend Python dependencies:
 
 ```bash
 python3.13 -m venv .venv
 source .venv/bin/activate
-python -m pip install fastapi uvicorn sqlalchemy python-multipart "scenedetect[opencv]" faster-whisper
+python -m pip install -r backend/requirements.txt
 ```
 
 Install FFmpeg using your operating system's package manager. On macOS with Homebrew:

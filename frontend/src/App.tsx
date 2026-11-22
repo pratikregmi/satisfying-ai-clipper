@@ -1,3 +1,4 @@
+
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import "./App.css";
@@ -118,6 +119,7 @@ function formatSize(bytes: number) {
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
+
   const [videos, setVideos] = useState<Video[]>([]);
   const [selectedVideoId, setSelectedVideoId] = useState<number | null>(null);
   const video = videos.find((item) => item.id === selectedVideoId) ?? null;
@@ -139,74 +141,85 @@ function App() {
   const [rightsConfirmed, setRightsConfirmed] = useState(false);
   const [ingesting, setIngesting] = useState(false);
   const [ingestError, setIngestError] = useState("");
+
   const [activePipeline, setActivePipeline] =
     useState<ActivePipeline | null>(null);
+
   const [pipelineStatus, setPipelineStatus] =
     useState<PipelineStatusResponse | null>(null);
 
-  const loadVideos = useCallback(async (preferredVideoId?: number) => {
-    const response = await fetch("/api/videos/");
-
-    if (!response.ok) {
-      throw new Error("Could not load your video library.");
-    }
-
-    const data: Video[] = await response.json();
-    setVideos(data);
-
-    if (data.length > 0) {
-      const preferredVideo =
-        data.find((item) => item.id === preferredVideoId) ??
-        data.find((item) => item.id === 2) ??
-        data[0];
-      setSelectedVideoId(preferredVideo.id);
-    } else {
-      setLoading(false);
-    }
-  }, []);
-
-  const loadScenes = useCallback(async (
-    videoId: number,
-    pageOffset: number
-  ) => {
-    setLoading(true);
-    setError("");
-
-    try {
-      const response = await fetch(
-        `/api/videos/${videoId}/scene-transcripts?limit=${PAGE_SIZE}&offset=${pageOffset}`
-      );
+  // Load videos and return the data so startup can recover
+  // an existing pipeline after a browser refresh.
+  const loadVideos = useCallback(
+    async (preferredVideoId?: number): Promise<Video[]> => {
+      const response = await fetch("/api/videos/");
 
       if (!response.ok) {
-        throw new Error("Could not load scenes and transcripts.");
+        throw new Error("Could not load your video library.");
       }
 
-      const data: SceneTranscriptPage = await response.json();
+      const data: Video[] = await response.json();
 
-      const mappedScenes: Scene[] = data.scenes.map((scene) => ({
-        id: scene.scene_id,
-        video_id: data.video_id,
-        scene_number: scene.scene_number,
-        start_time: scene.start_time,
-        end_time: scene.end_time,
-        duration: scene.duration,
-        thumbnail_url: scene.thumbnail_url,
-        transcript_segments: scene.transcript_segments,
-      }));
+      setVideos(data);
 
-      setScenes(mappedScenes);
-      setTotalScenes(data.total_scenes);
-      setOffset(data.offset);
-    } catch (err) {
-      setScenes([]);
-      setTotalScenes(0);
-      setError(
-        err instanceof Error ? err.message : "Something went wrong."
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+      if (data.length > 0) {
+        const preferredVideo =
+          data.find((item) => item.id === preferredVideoId) ??
+          data.find((item) => item.id === 2) ??
+          data[0];
+
+        setSelectedVideoId(preferredVideo.id);
+      } else {
+        setLoading(false);
+      }
+
+      return data;
+    },
+    []
+  );
+
+  const loadScenes = useCallback(
+    async (videoId: number, pageOffset: number) => {
+      setLoading(true);
+      setError("");
+
+      try {
+        const response = await fetch(
+          `/api/videos/${videoId}/scene-transcripts?limit=${PAGE_SIZE}&offset=${pageOffset}`
+        );
+
+        if (!response.ok) {
+          throw new Error("Could not load scenes and transcripts.");
+        }
+
+        const data: SceneTranscriptPage = await response.json();
+
+        const mappedScenes: Scene[] = data.scenes.map((scene) => ({
+          id: scene.scene_id,
+          video_id: data.video_id,
+          scene_number: scene.scene_number,
+          start_time: scene.start_time,
+          end_time: scene.end_time,
+          duration: scene.duration,
+          thumbnail_url: scene.thumbnail_url,
+          transcript_segments: scene.transcript_segments,
+        }));
+
+        setScenes(mappedScenes);
+        setTotalScenes(data.total_scenes);
+        setOffset(data.offset);
+      } catch (err) {
+        setScenes([]);
+        setTotalScenes(0);
+        setError(
+          err instanceof Error ? err.message : "Something went wrong."
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    []
+  );
 
   const loadClips = useCallback(async (videoId: number) => {
     setClipLoading(true);
@@ -220,6 +233,7 @@ function App() {
       }
 
       const data: GeneratedClipsResponse = await response.json();
+
       setClips(data.clips ?? []);
     } catch (err) {
       setClips([]);
@@ -230,7 +244,6 @@ function App() {
       setClipLoading(false);
     }
   }, []);
-
 
   const submitVideoUrl = async () => {
     if (ingesting) return;
@@ -256,12 +269,14 @@ function App() {
 
       if (!response.ok) {
         const detail = data.detail;
+
         const message =
           typeof detail === "string"
             ? detail
             : typeof detail?.message === "string"
               ? detail.message
               : "Could not import this video.";
+
         throw new Error(message);
       }
 
@@ -283,8 +298,7 @@ function App() {
 
       setSourceUrl("");
 
-      // Select the newly imported video without changing the existing
-      // preferred-video behavior during normal application startup.
+      // Select the newly imported video.
       await loadVideos(result.video_id);
     } catch (err) {
       setIngestError(
@@ -295,13 +309,83 @@ function App() {
     }
   };
 
+  // Recover an existing pipeline when the dashboard opens or refreshes.
+  // This checks existing jobs; it does NOT start a new pipeline.
   useEffect(() => {
-    loadVideos().catch((err) => {
-      setError(
-        err instanceof Error ? err.message : "Could not load video library."
-      );
-      setLoading(false);
-    });
+    let cancelled = false;
+
+    const initializeDashboard = async () => {
+      try {
+        const loadedVideos = await loadVideos();
+
+        // Check the pipeline status of each video.
+        const statuses = await Promise.all(
+          loadedVideos.map(async (item) => {
+            try {
+              const response = await fetch(
+                `/api/videos/${item.id}/pipeline/status`
+              );
+
+              if (!response.ok) {
+                return null;
+              }
+
+              const status: PipelineStatusResponse =
+                await response.json();
+
+              if (
+                status.status !== "pending" &&
+                status.status !== "running"
+              ) {
+                return null;
+              }
+
+              return {
+                videoId: item.id,
+                jobId: status.job_id,
+                status,
+              };
+            } catch {
+              // A failed status request for one video should
+              // not prevent recovery checks for other videos.
+              return null;
+            }
+          })
+        );
+
+        if (cancelled) return;
+
+        // Videos are returned newest first, so the first active
+        // job is the newest active pipeline.
+        const activeJob = statuses.find((item) => item !== null);
+
+        if (activeJob) {
+          setSelectedVideoId(activeJob.videoId);
+          setPipelineStatus(activeJob.status);
+
+          setActivePipeline({
+            videoId: activeJob.videoId,
+            jobId: activeJob.jobId,
+          });
+        }
+      } catch (err) {
+        if (cancelled) return;
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Could not load video library."
+        );
+
+        setLoading(false);
+      }
+    };
+
+    void initializeDashboard();
+
+    return () => {
+      cancelled = true;
+    };
   }, [loadVideos]);
 
   useEffect(() => {
@@ -324,6 +408,7 @@ function App() {
     loadClips(selectedVideoId);
   }, [selectedVideoId, loadClips]);
 
+  // Poll the recovered or newly created pipeline.
   useEffect(() => {
     if (activePipeline === null) return;
 
@@ -352,12 +437,13 @@ function App() {
         ) {
           setActivePipeline(null);
 
-          // Refresh the newly processed video's library, scenes and clips.
+          // Refresh the processed video's library, scenes and clips.
           await Promise.all([
             loadVideos(activePipeline.videoId),
             loadScenes(activePipeline.videoId, 0),
             loadClips(activePipeline.videoId),
           ]);
+
           return;
         }
 
@@ -366,6 +452,7 @@ function App() {
           return;
         }
 
+        // Continue polling while the pipeline is active.
         timeoutId = window.setTimeout(
           () => void pollPipelineStatus(),
           2000
@@ -378,6 +465,7 @@ function App() {
             ? err.message
             : "Could not retrieve pipeline progress."
         );
+
         setActivePipeline(null);
       }
     };
@@ -393,13 +481,14 @@ function App() {
     };
   }, [activePipeline, loadVideos, loadScenes, loadClips]);
 
-
   const selectScene = (scene: Scene) => {
     setCurrentScene(scene);
+
     if (videoRef.current) {
       videoRef.current.currentTime = scene.start_time;
+
       videoRef.current.play().catch(() => {
-        // Playback can require a direct user interaction in some browsers.
+        // Playback can require direct user interaction in some browsers.
       });
     }
   };
@@ -428,17 +517,21 @@ function App() {
 
         <nav className="navigation">
           <div className="nav-label">WORKSPACE</div>
+
           <a className="nav-item active" href="#dashboard">
             <span>▦</span> Scene Browser
           </a>
+
           <div className="nav-item disabled">
             <span>◈</span> AI Analysis
             <small>Coming soon</small>
           </div>
+
           <div className="nav-item disabled">
             <span>✂</span> Clip Editor
             <small>Coming soon</small>
           </div>
+
           <div className="nav-item disabled">
             <span>▤</span> Exports
             <small>Coming soon</small>
@@ -453,6 +546,7 @@ function App() {
               <small>Your files stay on this Mac</small>
             </div>
           </div>
+
           <div className="sidebar-version">SATISFYINGAI · v0.4.0</div>
         </div>
       </aside>
@@ -460,9 +554,12 @@ function App() {
       <section className="main-content" id="dashboard">
         <header className="topbar">
           <div>
-            <div className="breadcrumb">Workspace / Videos / Scene Browser</div>
+            <div className="breadcrumb">
+              Workspace / Videos / Scene Browser
+            </div>
             <h2>Scene Browser</h2>
           </div>
+
           <div className="topbar-right">
             <span className="connection">
               <span className="status-dot" /> Backend connected
@@ -483,6 +580,7 @@ function App() {
                 generate review clips and vertical Shorts.
               </p>
             </div>
+
             <span className="video-tag">SOURCE UP TO 1440P</span>
           </div>
 
@@ -527,6 +625,7 @@ function App() {
                 required
                 disabled={ingesting || activePipeline !== null}
               />
+
               <span>
                 I confirm that I have the necessary commercial rights or
                 permissions to use this video.
@@ -574,11 +673,13 @@ function App() {
                           ? "Processing failed"
                           : "Video processing"}
                   </strong>
+
                   <span>
                     Job #{pipelineStatus.job_id} ·{" "}
                     {pipelineStatus.current_stage.replace(/_/g, " ")}
                   </span>
                 </div>
+
                 <strong className="pipeline-percent">
                   {pipelineStatus.progress_percent}%
                 </strong>
@@ -627,12 +728,16 @@ function App() {
               <h3>{video?.original_filename || "Loading video..."}</h3>
               <p>Review your video and explore its detected scenes.</p>
             </div>
+
             <div className="video-controls">
               <label className="video-selector">
                 <span>SELECT VIDEO</span>
+
                 <select
                   value={selectedVideoId ?? ""}
-                  onChange={(event) => setSelectedVideoId(Number(event.target.value))}
+                  onChange={(event) =>
+                    setSelectedVideoId(Number(event.target.value))
+                  }
                   disabled={videos.length === 0}
                 >
                   {videos.map((item) => (
@@ -642,6 +747,7 @@ function App() {
                   ))}
                 </select>
               </label>
+
               <div className="video-tag">
                 VIDEO #{selectedVideoId ?? "—"}
               </div>
@@ -655,9 +761,14 @@ function App() {
                   ref={videoRef}
                   controls
                   preload="metadata"
-                  src={selectedVideoId !== null ? `/api/videos/${selectedVideoId}/stream` : undefined}
+                  src={
+                    selectedVideoId !== null
+                      ? `/api/videos/${selectedVideoId}/stream`
+                      : undefined
+                  }
                 />
               </div>
+
               <div className="player-footer">
                 <div>
                   <strong>
@@ -665,6 +776,7 @@ function App() {
                       ? `Scene ${currentScene.scene_number}`
                       : "Video preview"}
                   </strong>
+
                   <span>
                     {currentScene
                       ? `${formatTime(currentScene.start_time)} – ${formatTime(
@@ -673,6 +785,7 @@ function App() {
                       : "Select a scene to jump to that moment."}
                   </span>
                 </div>
+
                 <span className="quality-tag">
                   {video ? `${video.width} × ${video.height}` : "—"}
                 </span>
@@ -681,30 +794,36 @@ function App() {
 
             <div className="video-info-card">
               <div className="eyebrow">VIDEO INFORMATION</div>
+
               <div className="info-row">
                 <span>Duration</span>
                 <strong>{video ? formatTime(video.duration) : "—"}</strong>
               </div>
+
               <div className="info-row">
                 <span>Resolution</span>
                 <strong>
                   {video ? `${video.width} × ${video.height}` : "—"}
                 </strong>
               </div>
+
               <div className="info-row">
                 <span>Frame rate</span>
                 <strong>{video?.frame_rate || "—"}</strong>
               </div>
+
               <div className="info-row">
                 <span>File size</span>
                 <strong>{video ? formatSize(video.file_size) : "—"}</strong>
               </div>
+
               <div className="info-row">
                 <span>Audio</span>
                 <strong>
                   {video ? (video.has_audio ? "Available" : "None") : "—"}
                 </strong>
               </div>
+
               <div className="info-row">
                 <span>Detected scenes</span>
                 <strong>{totalScenes.toLocaleString()}</strong>
@@ -718,8 +837,11 @@ function App() {
             <div>
               <div className="eyebrow">YOUR GENERATED OUTPUTS</div>
               <h3>Generated Clips</h3>
-              <p>Preview and download your review clips and finished outputs.</p>
+              <p>
+                Preview and download your review clips and finished outputs.
+              </p>
             </div>
+
             <div className="video-tag">
               {clips.length} {clips.length === 1 ? "CANDIDATE" : "CANDIDATES"}
             </div>
@@ -738,6 +860,7 @@ function App() {
             <div className="clips-grid">
               {clips.map((clip) => {
                 const output = clip.shorts ?? clip.full;
+
                 const outputLabel = clip.shorts
                   ? "YouTube Shorts · 9:16"
                   : clip.full
@@ -758,6 +881,7 @@ function App() {
                             <strong>Review clip</strong>
                             <span>{formatSize(clip.review.size_bytes)}</span>
                           </div>
+
                           <div className="clip-video-frame">
                             <video
                               controls
@@ -765,6 +889,7 @@ function App() {
                               src={clip.review.url}
                             />
                           </div>
+
                           <a
                             className="clip-download"
                             href={clip.review.url}
@@ -781,8 +906,10 @@ function App() {
                             <strong>
                               {clip.shorts ? "YouTube Shorts" : "Full-screen"}
                             </strong>
+
                             <span>{formatSize(output.size_bytes)}</span>
                           </div>
+
                           <div
                             className={`clip-video-frame ${
                               clip.shorts ? "vertical" : ""
@@ -794,6 +921,7 @@ function App() {
                               src={output.url}
                             />
                           </div>
+
                           <a
                             className="clip-download"
                             href={output.url}
@@ -822,8 +950,11 @@ function App() {
             <div>
               <div className="eyebrow">VIDEO BREAKDOWN</div>
               <h3>Detected scenes</h3>
-              <p>Choose a scene to preview it, or select multiple scenes.</p>
+              <p>
+                Choose a scene to preview it, or select multiple scenes.
+              </p>
             </div>
+
             <div className="selection-count">
               <strong>{selectedScenes.length}</strong>
               <span>selected</span>
@@ -833,8 +964,10 @@ function App() {
           <div className="scene-toolbar">
             <span>
               Showing {scenes.length ? offset + 1 : 0}–
-              {Math.min(offset + scenes.length, totalScenes)} of {totalScenes} scenes
+              {Math.min(offset + scenes.length, totalScenes)} of {totalScenes}{" "}
+              scenes
             </span>
+
             <span>50 scenes per page</span>
           </div>
 
@@ -873,8 +1006,11 @@ function App() {
                           Thumbnail unavailable
                         </div>
                       )}
+
                       <span className="scene-play">▶</span>
-                      <span className="scene-number">#{scene.scene_number}</span>
+                      <span className="scene-number">
+                        #{scene.scene_number}
+                      </span>
                     </button>
 
                     <div className="scene-details">
@@ -882,6 +1018,7 @@ function App() {
                         <strong>Scene {scene.scene_number}</strong>
                         <span>{formatTime(scene.start_time)}</span>
                       </div>
+
                       <label className="scene-checkbox">
                         <input
                           type="checkbox"
@@ -900,7 +1037,9 @@ function App() {
                     <div className="scene-transcript">
                       <div className="transcript-heading">
                         <span>DETECTED DIALOGUE</span>
-                        <span>{scene.transcript_segments.length} segments</span>
+                        <span>
+                          {scene.transcript_segments.length} segments
+                        </span>
                       </div>
 
                       {scene.transcript_segments.length > 0 ? (
@@ -913,6 +1052,7 @@ function App() {
                               <span className="transcript-time">
                                 {formatTime(segment.start_time)}
                               </span>
+
                               <p>{segment.text}</p>
                             </div>
                           ))}
@@ -932,16 +1072,27 @@ function App() {
           <div className="pagination">
             <button
               disabled={currentPage <= 1 || loading}
-              onClick={() => selectedVideoId !== null && loadScenes(selectedVideoId, Math.max(0, offset - PAGE_SIZE))}
+              onClick={() =>
+                selectedVideoId !== null &&
+                loadScenes(
+                  selectedVideoId,
+                  Math.max(0, offset - PAGE_SIZE)
+                )
+              }
             >
               ← Previous
             </button>
+
             <span>
               Page <strong>{currentPage}</strong> of {totalPages}
             </span>
+
             <button
               disabled={currentPage >= totalPages || loading}
-              onClick={() => selectedVideoId !== null && loadScenes(selectedVideoId, offset + PAGE_SIZE)}
+              onClick={() =>
+                selectedVideoId !== null &&
+                loadScenes(selectedVideoId, offset + PAGE_SIZE)
+              }
             >
               Next →
             </button>

@@ -7,6 +7,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+coverage/
+.cache/
 
 # Frontend dependencies and build output
 node_modules/
@@ -36,6 +40,13 @@ logs/
 !.vscode/extensions.json
 .idea/
 .DS_Store
+Thumbs.db
+*.swp
+*.tmp
+*.temp
+
+# Accidental root command-output file
+/cmd
 # Local logs and project backups
 logs.txt
 backups/

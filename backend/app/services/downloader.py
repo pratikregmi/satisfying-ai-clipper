@@ -1,6 +1,10 @@
 import ipaddress
 import mimetypes
+import os
 import socket
+import subprocess
+import sys
+import tempfile
 import uuid
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -75,16 +79,172 @@ def _get_file_extension(url: str, content_type: str) -> str:
     return ".mp4"
 
 
+
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+}
+
+
+def _validate_youtube_url(url: str) -> str:
+    """Accept only HTTPS URLs on explicitly approved YouTube hosts."""
+
+    parsed = urlparse(url.strip())
+
+    if parsed.scheme != "https":
+        raise ValueError("YouTube URLs must use HTTPS.")
+
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Invalid YouTube URL.")
+
+    hostname = parsed.hostname.lower().rstrip(".")
+
+    if hostname not in YOUTUBE_HOSTS:
+        raise ValueError("Only supported YouTube domains are accepted.")
+
+    try:
+        if parsed.port not in (None, 443):
+            raise ValueError("Non-standard YouTube URL ports are not allowed.")
+    except ValueError as exc:
+        raise ValueError("Invalid YouTube URL port.") from exc
+
+    try:
+        addresses = socket.getaddrinfo(
+            hostname,
+            443,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise ValueError("Could not resolve YouTube host.") from exc
+
+    if not addresses:
+        raise ValueError("YouTube host has no valid IP address.")
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+
+        if not ip.is_global:
+            raise ValueError("YouTube host resolved to a non-public address.")
+
+    return url.strip()
+
+
+def _download_youtube_video(
+    url: str,
+    destination_dir: Path,
+) -> Path:
+    """Download one YouTube video without re-encoding its streams."""
+
+    url = _validate_youtube_url(url)
+
+    destination_dir = Path(destination_dir).resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    # Keep all intermediate files isolated and remove them on every exit.
+    with tempfile.TemporaryDirectory(
+        prefix=".yt-dlp-",
+        dir=destination_dir,
+    ) as temporary_directory:
+        temporary_dir = Path(temporary_directory)
+
+        output_template = str(
+            temporary_dir / "%(id)s.%(ext)s"
+        )
+
+        command = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--ignore-config",
+            "--no-playlist",
+            "--no-warnings",
+            "--no-progress",
+            "--quiet",
+            "--no-simulate",
+            "--socket-timeout", "30",
+            "--max-filesize", "1G",
+            "--format",
+            "bestvideo[height<=1440]+bestaudio/best[height<=1440]",
+            "--merge-output-format", "mkv",
+            "--output", output_template,
+            "--print", "after_move:filepath",
+            url,
+        ]
+
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=7200,
+            check=True,
+        )
+
+        printed_paths = [
+            line.strip()
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        ]
+
+        if not printed_paths:
+            raise ValueError(
+                "yt-dlp completed without reporting the downloaded file."
+            )
+
+        downloaded_path = Path(printed_paths[-1]).resolve()
+
+        # Do not accept paths outside this download's temporary directory.
+        if downloaded_path.parent != temporary_dir.resolve():
+            raise ValueError(
+                "yt-dlp returned an unexpected output location."
+            )
+
+        if (
+            not downloaded_path.is_file()
+            or downloaded_path.stat().st_size == 0
+        ):
+            raise ValueError("YouTube download is missing or empty.")
+
+        file_size = downloaded_path.stat().st_size
+
+        if file_size > MAX_DOWNLOAD_SIZE:
+            raise ValueError(
+                "Downloaded YouTube video exceeds the 1 GB limit."
+            )
+
+        extension = downloaded_path.suffix.lower()
+
+        if extension not in ALLOWED_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported YouTube download format: {extension}"
+            )
+
+        # Atomic, no-overwrite transfer into the permanent source directory.
+        destination = (
+            destination_dir / f"{uuid.uuid4().hex}{extension}"
+        )
+
+        os.link(downloaded_path, destination)
+
+        return destination
+
+
 def download_video(
     url: str,
     destination_dir: Path,
 ) -> Path:
     """
-    Download an authorized direct HTTPS video into the
-    caller-supplied video-specific directory.
-
-    YouTube watch-page URLs are not supported.
+    Download an authorized direct HTTPS video or a supported
+    YouTube video into the caller-supplied video-specific directory.
     """
+
+    parsed_url = urlparse(url.strip())
+    hostname = (parsed_url.hostname or "").lower().rstrip(".")
+
+    if hostname in YOUTUBE_HOSTS:
+        return _download_youtube_video(url, destination_dir)
 
     destination_dir = Path(destination_dir).resolve()
     destination_dir.mkdir(parents=True, exist_ok=True)

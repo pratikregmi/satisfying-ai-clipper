@@ -1,5 +1,5 @@
+import re
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 from uuid import uuid4
 import subprocess
 
@@ -221,7 +221,7 @@ def ingest_video_url(
     db: Session = Depends(get_db),
 ):
     """
-    Download an authorized direct HTTPS video URL,
+    Download an authorized direct HTTPS video URL or supported YouTube URL,
     save it inside its video-specific directory,
     create its database record and pipeline job,
     and automatically start the processing pipeline.
@@ -268,17 +268,15 @@ def ingest_video_url(
         thumbnail_path = paths["upload_thumbnail"]
         generate_thumbnail(video_path, thumbnail_path)
 
-        url_filename = unquote(
-            Path(urlparse(request.source_url).path).name
-        ).strip()
+        source_stem = re.sub(
+            r"[^A-Za-z0-9._ -]+",
+            "_",
+            Path(request.source_name).stem,
+        ).strip(" ._-") or "youtube_video"
 
         original_filename = (
-            Path(url_filename).name
-            if url_filename
-            else video_path.name
-        )
-
-        original_filename = original_filename[:255]
+            f"{source_stem}{extension}"
+        )[:255]
 
         file_size = video_path.stat().st_size
 

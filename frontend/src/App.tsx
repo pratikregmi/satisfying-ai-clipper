@@ -69,6 +69,31 @@ type GeneratedClipsResponse = {
   clips: GeneratedClip[];
 };
 
+type PipelineStatusResponse = {
+  job_id: number;
+  video_id: number;
+  status: string;
+  current_stage: string;
+  progress_percent: number;
+  error_message: string | null;
+};
+
+type ActivePipeline = {
+  videoId: number;
+  jobId: number;
+};
+
+type IngestVideoResponse = {
+  message: string;
+  video_id: number;
+  job_id: number;
+  original_filename: string;
+  duration: number;
+  status: string;
+  current_stage: string;
+  progress_percent: number;
+};
+
 function formatTime(seconds: number) {
   const safeSeconds = Math.max(0, Math.floor(seconds));
   const hours = Math.floor(safeSeconds / 3600);
@@ -109,7 +134,17 @@ function App() {
   const [clipLoading, setClipLoading] = useState(false);
   const [clipError, setClipError] = useState("");
 
-  const loadVideos = useCallback(async () => {
+  const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceName, setSourceName] = useState("");
+  const [rightsConfirmed, setRightsConfirmed] = useState(false);
+  const [ingesting, setIngesting] = useState(false);
+  const [ingestError, setIngestError] = useState("");
+  const [activePipeline, setActivePipeline] =
+    useState<ActivePipeline | null>(null);
+  const [pipelineStatus, setPipelineStatus] =
+    useState<PipelineStatusResponse | null>(null);
+
+  const loadVideos = useCallback(async (preferredVideoId?: number) => {
     const response = await fetch("/api/videos/");
 
     if (!response.ok) {
@@ -120,7 +155,10 @@ function App() {
     setVideos(data);
 
     if (data.length > 0) {
-      const preferredVideo = data.find((item) => item.id === 2) ?? data[0];
+      const preferredVideo =
+        data.find((item) => item.id === preferredVideoId) ??
+        data.find((item) => item.id === 2) ??
+        data[0];
       setSelectedVideoId(preferredVideo.id);
     } else {
       setLoading(false);
@@ -193,6 +231,70 @@ function App() {
     }
   }, []);
 
+
+  const submitVideoUrl = async () => {
+    if (ingesting) return;
+
+    setIngesting(true);
+    setIngestError("");
+    setPipelineStatus(null);
+
+    try {
+      const response = await fetch("/api/videos/ingest-url", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          source_url: sourceUrl.trim(),
+          source_name: sourceName.trim(),
+          commercial_rights_confirmed: rightsConfirmed,
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        const detail = data.detail;
+        const message =
+          typeof detail === "string"
+            ? detail
+            : typeof detail?.message === "string"
+              ? detail.message
+              : "Could not import this video.";
+        throw new Error(message);
+      }
+
+      const result = data as IngestVideoResponse;
+
+      setPipelineStatus({
+        job_id: result.job_id,
+        video_id: result.video_id,
+        status: result.status,
+        current_stage: result.current_stage,
+        progress_percent: result.progress_percent,
+        error_message: null,
+      });
+
+      setActivePipeline({
+        videoId: result.video_id,
+        jobId: result.job_id,
+      });
+
+      setSourceUrl("");
+
+      // Select the newly imported video without changing the existing
+      // preferred-video behavior during normal application startup.
+      await loadVideos(result.video_id);
+    } catch (err) {
+      setIngestError(
+        err instanceof Error ? err.message : "Could not import this video."
+      );
+    } finally {
+      setIngesting(false);
+    }
+  };
+
   useEffect(() => {
     loadVideos().catch((err) => {
       setError(
@@ -221,6 +323,76 @@ function App() {
 
     loadClips(selectedVideoId);
   }, [selectedVideoId, loadClips]);
+
+  useEffect(() => {
+    if (activePipeline === null) return;
+
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof window.setTimeout> | undefined;
+
+    const pollPipelineStatus = async () => {
+      try {
+        const response = await fetch(
+          `/api/videos/${activePipeline.videoId}/pipeline/status`
+        );
+
+        if (!response.ok) {
+          throw new Error("Could not retrieve pipeline progress.");
+        }
+
+        const data: PipelineStatusResponse = await response.json();
+
+        if (cancelled) return;
+
+        setPipelineStatus(data);
+
+        if (
+          data.status === "completed" ||
+          data.status === "completed_with_warnings"
+        ) {
+          setActivePipeline(null);
+
+          // Refresh the newly processed video's library, scenes and clips.
+          await Promise.all([
+            loadVideos(activePipeline.videoId),
+            loadScenes(activePipeline.videoId, 0),
+            loadClips(activePipeline.videoId),
+          ]);
+          return;
+        }
+
+        if (data.status === "failed") {
+          setActivePipeline(null);
+          return;
+        }
+
+        timeoutId = window.setTimeout(
+          () => void pollPipelineStatus(),
+          2000
+        );
+      } catch (err) {
+        if (cancelled) return;
+
+        setIngestError(
+          err instanceof Error
+            ? err.message
+            : "Could not retrieve pipeline progress."
+        );
+        setActivePipeline(null);
+      }
+    };
+
+    void pollPipelineStatus();
+
+    return () => {
+      cancelled = true;
+
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [activePipeline, loadVideos, loadScenes, loadClips]);
+
 
   const selectScene = (scene: Scene) => {
     setCurrentScene(scene);
@@ -300,6 +472,153 @@ function App() {
         </header>
 
         {error && <div className="error-banner">{error}</div>}
+
+        <section className="ingest-section">
+          <div className="ingest-heading">
+            <div>
+              <div className="eyebrow">NEW SOURCE</div>
+              <h3>Import a video</h3>
+              <p>
+                Add a YouTube video to your local studio and automatically
+                generate review clips and vertical Shorts.
+              </p>
+            </div>
+            <span className="video-tag">SOURCE UP TO 1440P</span>
+          </div>
+
+          <form
+            className="ingest-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitVideoUrl();
+            }}
+          >
+            <label className="ingest-field">
+              <span>YouTube video URL</span>
+              <input
+                type="url"
+                value={sourceUrl}
+                onChange={(event) => setSourceUrl(event.target.value)}
+                placeholder="https://www.youtube.com/watch?v=..."
+                maxLength={2048}
+                required
+                disabled={ingesting || activePipeline !== null}
+              />
+            </label>
+
+            <label className="ingest-field">
+              <span>Video name</span>
+              <input
+                type="text"
+                value={sourceName}
+                onChange={(event) => setSourceName(event.target.value)}
+                placeholder="Give this video a name"
+                maxLength={255}
+                required
+                disabled={ingesting || activePipeline !== null}
+              />
+            </label>
+
+            <label className="rights-confirmation">
+              <input
+                type="checkbox"
+                checked={rightsConfirmed}
+                onChange={(event) => setRightsConfirmed(event.target.checked)}
+                required
+                disabled={ingesting || activePipeline !== null}
+              />
+              <span>
+                I confirm that I have the necessary commercial rights or
+                permissions to use this video.
+              </span>
+            </label>
+
+            <button
+              className="ingest-submit"
+              type="submit"
+              disabled={
+                ingesting ||
+                activePipeline !== null ||
+                !sourceUrl.trim() ||
+                !sourceName.trim() ||
+                !rightsConfirmed
+              }
+            >
+              {ingesting ? "Importing video..." : "Import and process video"}
+            </button>
+          </form>
+
+          {ingesting && (
+            <div className="ingest-message" role="status">
+              Downloading the source and preparing your processing job.
+              Larger videos may take some time to import.
+            </div>
+          )}
+
+          {ingestError && (
+            <div className="ingest-error" role="alert">
+              {ingestError}
+            </div>
+          )}
+
+          {pipelineStatus && (
+            <div className="pipeline-progress" aria-live="polite">
+              <div className="pipeline-progress-heading">
+                <div>
+                  <strong>
+                    {pipelineStatus.status === "completed"
+                      ? "Processing completed"
+                      : pipelineStatus.status === "completed_with_warnings"
+                        ? "Completed with warnings"
+                        : pipelineStatus.status === "failed"
+                          ? "Processing failed"
+                          : "Video processing"}
+                  </strong>
+                  <span>
+                    Job #{pipelineStatus.job_id} ·{" "}
+                    {pipelineStatus.current_stage.replace(/_/g, " ")}
+                  </span>
+                </div>
+                <strong className="pipeline-percent">
+                  {pipelineStatus.progress_percent}%
+                </strong>
+              </div>
+
+              <div
+                className="progress-track"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={pipelineStatus.progress_percent}
+              >
+                <span
+                  style={{
+                    width: `${Math.max(
+                      0,
+                      Math.min(100, pipelineStatus.progress_percent)
+                    )}%`,
+                  }}
+                />
+              </div>
+
+              {pipelineStatus.status === "failed" &&
+                pipelineStatus.error_message && (
+                  <p className="pipeline-error">
+                    {pipelineStatus.error_message}
+                  </p>
+                )}
+
+              {(pipelineStatus.status === "completed" ||
+                pipelineStatus.status === "completed_with_warnings") && (
+                <p className="pipeline-success">
+                  {pipelineStatus.status === "completed_with_warnings"
+                    ? "Processing finished, but some stages reported warnings. Your available scenes and outputs have been refreshed below."
+                    : "Your scenes and generated outputs have been refreshed below."}
+                </p>
+              )}
+            </div>
+          )}
+        </section>
 
         <section className="video-section">
           <div className="section-heading">

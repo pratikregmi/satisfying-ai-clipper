@@ -1018,14 +1018,14 @@ def run_pipeline_job(
                 ),
             )
 
-        # Stage 10: Generate the configured output format.
-        # FULL_SCREEN=False currently generates YouTube Shorts.
+        # Stage 10: Generate Shorts directly from the original source.
         current_stage = "output_generation"
         _save_stage(db, job, current_stage, "running", 97)
 
         if selected_candidates:
             output_generation_result = generate_output_clips(
                 video_id=video.id,
+                video_path=video_path,
                 selected_candidates=selected_candidates,
             )
 

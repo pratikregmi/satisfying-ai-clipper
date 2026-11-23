@@ -90,12 +90,22 @@ type GeneratedClipsResponse = {
   clips: GeneratedClip[];
 };
 
+type PipelineStageDetail = {
+  status?: string;
+  error?: string;
+  started_at?: string;
+  completed_at?: string;
+  updated_at?: string;
+  [key: string]: unknown;
+};
+
 type PipelineStatusResponse = {
   job_id: number;
   video_id: number;
   status: string;
   current_stage: string;
   progress_percent: number;
+  stage_details?: Record<string, PipelineStageDetail>;
   error_message: string | null;
 };
 
@@ -114,6 +124,69 @@ type IngestVideoResponse = {
   current_stage: string;
   progress_percent: number;
 };
+
+const PIPELINE_STAGES = [
+  {
+    key: "transcription",
+    label: "Transcribing audio",
+    description: "Converting spoken audio into searchable text.",
+  },
+  {
+    key: "scene_detection",
+    label: "Detecting scenes",
+    description: "Finding scene changes and meaningful visual sections.",
+  },
+  {
+    key: "thumbnail_generation",
+    label: "Creating thumbnails",
+    description: "Preparing preview images for detected scenes.",
+  },
+  {
+    key: "scene_transcript_matching",
+    label: "Matching scenes with speech",
+    description: "Connecting scene timings with the transcript.",
+  },
+  {
+    key: "visual_analysis",
+    label: "Analyzing the visuals",
+    description: "Reviewing scene content and visual context.",
+  },
+  {
+    key: "moment_discovery",
+    label: "Discovering interesting moments",
+    description: "Finding promising moments that may work as Shorts.",
+  },
+  {
+    key: "preliminary_ranking",
+    label: "Ranking candidate moments",
+    description: "Prioritizing the strongest moments for evaluation.",
+  },
+  {
+    key: "ai_evaluation",
+    label: "Evaluating moments",
+    description: "Scoring and reviewing shortlisted candidates.",
+  },
+  {
+    key: "final_ranking",
+    label: "Selecting the best moments",
+    description: "Choosing the final moments for clip generation.",
+  },
+  {
+    key: "clip_generation",
+    label: "Generating clips",
+    description: "Creating the selected video clips.",
+  },
+  {
+    key: "output_generation",
+    label: "Preparing Shorts",
+    description: "Producing the final vertical video outputs.",
+  },
+  {
+    key: "results_export",
+    label: "Saving results",
+    description: "Exporting the completed processing results.",
+  },
+];
 
 function formatTime(seconds: number) {
   const safeSeconds = Math.max(0, Math.floor(seconds));
@@ -139,10 +212,13 @@ function formatSize(bytes: number) {
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [activeSection, setActiveSection] = useState("new-project");
+  const [selectedShortsVideoId, setSelectedShortsVideoId] = useState<number | null>(null);
 
   const [videos, setVideos] = useState<Video[]>([]);
   const [selectedVideoId, setSelectedVideoId] = useState<number | null>(null);
-  const video = videos.find((item) => item.id === selectedVideoId) ?? null;
+  const shortsSourceVideo =
+    videos.find((item) => item.id === selectedShortsVideoId) ?? null;
 
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [selectedScenes, setSelectedScenes] = useState<number[]>([]);
@@ -153,8 +229,10 @@ function App() {
   const [error, setError] = useState("");
 
   const [clips, setClips] = useState<GeneratedClip[]>([]);
-  const [clipLoading, setClipLoading] = useState(false);
-  const [clipError, setClipError] = useState("");
+  const [clipsByVideo, setClipsByVideo] = useState<Record<number, GeneratedClip[]>>({});
+  const [clipGroupsLoading, setClipGroupsLoading] = useState(false);
+  const [, setClipLoading] = useState(false);
+  const [, setClipError] = useState("");
   const [metadataDrafts, setMetadataDrafts] = useState<
     Record<number, ClipMetadataDraft>
   >({});
@@ -288,8 +366,8 @@ function App() {
     }
   }, []);
 
-  const generateClipMetadata = async (candidateId: number) => {
-    if (selectedVideoId === null || metadataGeneratingId !== null) return;
+  const generateClipMetadata = async (videoId: number, candidateId: number) => {
+    if (metadataGeneratingId !== null) return;
 
     setMetadataGeneratingId(candidateId);
     setMetadataMessages((current) => ({
@@ -299,7 +377,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `/api/videos/${selectedVideoId}/clips/${candidateId}/metadata/generate`,
+        `/api/videos/${videoId}/clips/${candidateId}/metadata/generate`,
         { method: "POST" }
       );
 
@@ -324,6 +402,14 @@ function App() {
             : clip
         )
       );
+      setClipsByVideo((current) => ({
+        ...current,
+        [videoId]: (current[videoId] ?? []).map((clip) =>
+          clip.candidate_id === candidateId
+            ? { ...clip, metadata }
+            : clip
+        ),
+      }));
 
       setMetadataDrafts((current) => ({
         ...current,
@@ -349,8 +435,8 @@ function App() {
     }
   };
 
-  const saveClipMetadata = async (candidateId: number) => {
-    if (selectedVideoId === null || metadataSavingId !== null) return;
+  const saveClipMetadata = async (videoId: number, candidateId: number) => {
+    if (metadataSavingId !== null) return;
 
     const draft = metadataDrafts[candidateId];
 
@@ -385,7 +471,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `/api/videos/${selectedVideoId}/clips/${candidateId}/metadata`,
+        `/api/videos/${videoId}/clips/${candidateId}/metadata`,
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -412,6 +498,14 @@ function App() {
             : clip
         )
       );
+      setClipsByVideo((current) => ({
+        ...current,
+        [videoId]: (current[videoId] ?? []).map((clip) =>
+          clip.candidate_id === candidateId
+            ? { ...clip, metadata }
+            : clip
+        ),
+      }));
 
       setMetadataDrafts((current) => ({
         ...current,
@@ -620,6 +714,73 @@ function App() {
     loadClips(selectedVideoId);
   }, [selectedVideoId, loadClips]);
 
+
+  // Load generated clips for every uploaded video for the My Shorts collection.
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadAllVideoClips = async () => {
+      if (videos.length === 0) {
+        setClipsByVideo({});
+        setClipGroupsLoading(false);
+        return;
+      }
+
+      setClipGroupsLoading(true);
+
+      try {
+        const entries = await Promise.all(
+          videos.map(async (item) => {
+            try {
+              const response = await fetch(`/api/videos/${item.id}/clips`);
+
+              if (!response.ok) {
+                throw new Error("Could not load clips.");
+              }
+
+              const data: GeneratedClipsResponse = await response.json();
+              return [item.id, data.clips ?? []] as const;
+            } catch {
+              return [item.id, []] as const;
+            }
+          })
+        );
+
+        if (cancelled) return;
+
+        setClipsByVideo(Object.fromEntries(entries));
+
+        const loadedDrafts = Object.fromEntries(
+          entries.flatMap(([, videoClips]) =>
+            videoClips.map((clip) => [
+              clip.candidate_id,
+              {
+                title: clip.metadata?.title ?? "",
+                description: clip.metadata?.description ?? "",
+                hashtags: clip.metadata?.hashtags.join(" ") ?? "",
+              },
+            ])
+          )
+        );
+
+        setMetadataDrafts((current) => ({
+          ...current,
+          ...loadedDrafts,
+        }));
+      } finally {
+        if (!cancelled) {
+          setClipGroupsLoading(false);
+        }
+      }
+    };
+
+    void loadAllVideoClips();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [videos]);
+
   // Poll the recovered or newly created pipeline.
   useEffect(() => {
     if (activePipeline === null) return;
@@ -716,6 +877,16 @@ function App() {
   const totalPages = Math.max(1, Math.ceil(totalScenes / PAGE_SIZE));
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
 
+  const pageDetails: Record<string, { title: string; breadcrumb: string }> = {
+    "new-project": { title: "Home", breadcrumb: "Workspace / Home" },
+    "video-library": { title: "Create", breadcrumb: "Workspace / Create" },
+    "original-content": { title: "Original Content", breadcrumb: "Workspace / Original Content" },
+    "my-shorts": { title: "My Shorts", breadcrumb: "Workspace / My Shorts" },
+    "scene-library": { title: "Scene Library", breadcrumb: "Workspace / Scene Library" },
+  };
+
+  const currentPageDetails = pageDetails[activeSection] ?? pageDetails["new-project"];
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -730,24 +901,28 @@ function App() {
         <nav className="navigation">
           <div className="nav-label">WORKSPACE</div>
 
-          <a className="nav-item active" href="#dashboard">
-            <span>▦</span> Scene Browser
+          <a className={activeSection === "new-project" ? "nav-item active" : "nav-item"} href="#new-project" onClick={() => setActiveSection("new-project")}>
+            <span>⌂</span> Home
           </a>
 
-          <div className="nav-item disabled">
-            <span>◈</span> AI Analysis
-            <small>Coming soon</small>
-          </div>
+          <a className={activeSection === "video-library" ? "nav-item active" : "nav-item"} href="#new-project" onClick={() => setActiveSection("video-library")}>
+            <span>✧</span> Create
+          </a>
 
-          <div className="nav-item disabled">
-            <span>✂</span> Clip Editor
-            <small>Coming soon</small>
-          </div>
+          <a className={activeSection === "original-content" ? "nav-item active" : "nav-item"} href="#original-content" onClick={() => setActiveSection("original-content")}>
+            <span>▤</span> Original Content
+          </a>
 
-          <div className="nav-item disabled">
-            <span>▤</span> Exports
-            <small>Coming soon</small>
-          </div>
+          <a className={activeSection === "my-shorts" ? "nav-item active" : "nav-item"} href="#my-shorts" onClick={() => {
+            setSelectedShortsVideoId(null);
+            setActiveSection("my-shorts");
+          }}>
+            <span>▣</span> My Shorts
+          </a>
+
+          <a className={activeSection === "scene-library" ? "nav-item active" : "nav-item"} href="#scene-library" onClick={() => setActiveSection("scene-library")}>
+            <span>▦</span> Scene Library
+          </a>
         </nav>
 
         <div className="sidebar-bottom">
@@ -767,9 +942,9 @@ function App() {
         <header className="topbar">
           <div>
             <div className="breadcrumb">
-              Workspace / Videos / Scene Browser
+              {currentPageDetails.breadcrumb}
             </div>
-            <h2>Scene Browser</h2>
+            <h2>{currentPageDetails.title}</h2>
           </div>
 
           <div className="topbar-right">
@@ -782,7 +957,128 @@ function App() {
 
         {error && <div className="error-banner">{error}</div>}
 
-        <section className="ingest-section">
+        {activeSection === "new-project" && (
+          <section className="dashboard-welcome">
+            <div className="eyebrow">YOUR CREATIVE WORKSPACE</div>
+            <h3>Turn your videos into engaging Shorts.</h3>
+            <p>
+              Import a YouTube video, let your local studio analyze it,
+              and review your generated clips and vertical videos.
+            </p>
+
+            <div className="dashboard-actions">
+              <a
+                href="#new-project"
+                className="welcome-primary"
+                onClick={() => setActiveSection("video-library")}
+              >
+                Import a video <span>→</span>
+              </a>
+              <a
+                href="#original-content"
+                className="welcome-secondary"
+                onClick={() => setActiveSection("original-content")}
+              >
+                Browse video library
+              </a>
+            </div>
+
+            <div className="dashboard-stats">
+              <div className="dashboard-stat">
+                <strong>{videos.length.toLocaleString()}</strong>
+                <span>Imported videos</span>
+              </div>
+              <div className="dashboard-stat">
+                <strong>{totalScenes.toLocaleString()}</strong>
+                <span>Scenes in selected video</span>
+              </div>
+              <div className="dashboard-stat">
+                <strong>{clips.length.toLocaleString()}</strong>
+                <span>Clip candidates</span>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {activeSection === "new-project" && (
+          <section className="home-library" id="home-video-library">
+            <div className="section-heading">
+              <div>
+                <div className="eyebrow">YOUR COLLECTION</div>
+                <h3>Your videos</h3>
+                <p>Select a video to continue working on it.</p>
+              </div>
+              <span className="video-tag">
+                {videos.length} {videos.length === 1 ? "VIDEO" : "VIDEOS"}
+              </span>
+            </div>
+
+            {loading && videos.length === 0 ? (
+              <div className="loading-state">Loading your video collection...</div>
+            ) : videos.length === 0 ? (
+              <div className="home-library-empty">
+                <div className="home-library-empty-icon">＋</div>
+                <strong>Your video collection starts here</strong>
+                <p>Import a video to begin creating clips and Shorts.</p>
+                <a
+                  href="#new-project"
+                  onClick={() => setActiveSection("video-library")}
+                >
+                  Import your first video →
+                </a>
+              </div>
+            ) : (
+              <div className="home-video-grid">
+                {videos.map((item) => (
+                  <article className="home-video-card" key={item.id}>
+                    <div className="home-video-art">
+                      <img
+                        className="home-video-thumbnail"
+                        src={`/api/videos/${item.id}/thumbnail`}
+                        alt=""
+                        loading="lazy"
+                        onError={(event) => {
+                          event.currentTarget.style.display = "none";
+                        }}
+                      />
+                      <span className="home-video-number">
+                        VIDEO #{item.id}
+                      </span>
+                      <span className="home-video-play">▶</span>
+                      <span className="home-video-duration">
+                        {formatTime(item.duration)}
+                      </span>
+                    </div>
+
+                    <div className="home-video-details">
+                      <h4 title={item.original_filename}>
+                        {item.original_filename}
+                      </h4>
+                      <div className="home-video-meta">
+                        <span>{item.width} × {item.height}</span>
+                        <span>{formatSize(item.file_size)}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="home-video-open"
+                        onClick={() => {
+                          setSelectedVideoId(item.id);
+                          setActiveSection("scene-library");
+                        }}
+                      >
+                        Open video <span>→</span>
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeSection === "video-library" && (
+          <>
+        <section className="ingest-section" id="new-project">
           <div className="ingest-heading">
             <div>
               <div className="eyebrow">NEW SOURCE</div>
@@ -878,20 +1174,20 @@ function App() {
                 <div>
                   <strong>
                     {pipelineStatus.status === "completed"
-                      ? "Processing completed"
+                      ? "Your video is ready"
                       : pipelineStatus.status === "completed_with_warnings"
-                        ? "Completed with warnings"
+                        ? "Processing finished with warnings"
                         : pipelineStatus.status === "failed"
-                          ? "Processing failed"
-                          : "Video processing"}
+                          ? "Processing needs attention"
+                          : "Your video is being processed"}
                   </strong>
-
                   <span>
                     Job #{pipelineStatus.job_id} ·{" "}
-                    {pipelineStatus.current_stage.replace(/_/g, " ")}
+                    {pipelineStatus.current_stage === "completed"
+                      ? "All steps finished"
+                      : pipelineStatus.current_stage.replace(/_/g, " ")}
                   </span>
                 </div>
-
                 <strong className="pipeline-percent">
                   {pipelineStatus.progress_percent}%
                 </strong>
@@ -900,6 +1196,7 @@ function App() {
               <div
                 className="progress-track"
                 role="progressbar"
+                aria-label="Video processing progress"
                 aria-valuemin={0}
                 aria-valuemax={100}
                 aria-valuenow={pipelineStatus.progress_percent}
@@ -914,6 +1211,114 @@ function App() {
                 />
               </div>
 
+              <div className="pipeline-timeline">
+                <div className="pipeline-timeline-heading">
+                  <div>
+                    <strong>Processing activity</strong>
+                    <span>Live updates from your video processing job</span>
+                  </div>
+                  <span>
+                    {PIPELINE_STAGES.filter((stage) => {
+                      const state =
+                        pipelineStatus.stage_details?.[stage.key]?.status;
+                      return [
+                        "completed",
+                        "completed_with_warnings",
+                        "skipped",
+                        "failed",
+                      ].includes(state ?? "");
+                    }).length}{" "}
+                    / {PIPELINE_STAGES.length} steps finished
+                  </span>
+                </div>
+
+                <div className="pipeline-stage-list">
+                  <div className="pipeline-stage is-completed">
+                    <span className="pipeline-stage-marker">✓</span>
+                    <div className="pipeline-stage-copy">
+                      <strong>Video imported</strong>
+                      <span>
+                        The source video was downloaded and added to your library.
+                      </span>
+                    </div>
+                    <span className="pipeline-stage-state">Complete</span>
+                  </div>
+
+                  {PIPELINE_STAGES.map((stage) => {
+                    const detail =
+                      pipelineStatus.stage_details?.[stage.key];
+                    const recordedStatus = detail?.status;
+                    const isTerminal = [
+                      "completed",
+                      "completed_with_warnings",
+                    ].includes(pipelineStatus.status);
+
+                    const stageStatus =
+                      recordedStatus ||
+                      (pipelineStatus.current_stage === stage.key &&
+                      ["pending", "running"].includes(pipelineStatus.status)
+                        ? "running"
+                        : "pending");
+
+                    const stateLabel =
+                      stageStatus === "completed"
+                        ? "Complete"
+                        : stageStatus === "completed_with_warnings"
+                          ? "Warnings"
+                          : stageStatus === "skipped"
+                            ? "Skipped"
+                            : stageStatus === "failed"
+                              ? "Failed"
+                              : stageStatus === "running"
+                                ? "In progress"
+                                : isTerminal
+                                  ? "Not run"
+                                  : "Waiting";
+
+                    const marker =
+                      stageStatus === "completed" ||
+                      stageStatus === "completed_with_warnings" ||
+                      stageStatus === "skipped"
+                        ? "✓"
+                        : stageStatus === "failed"
+                          ? "!"
+                          : stageStatus === "running"
+                            ? "•"
+                            : "·";
+
+                    return (
+                      <div
+                        className={`pipeline-stage pipeline-stage-${stageStatus}`}
+                        key={stage.key}
+                      >
+                        <span className="pipeline-stage-marker">{marker}</span>
+                        <div className="pipeline-stage-copy">
+                          <strong>{stage.label}</strong>
+                          <span>{stage.description}</span>
+                          {detail?.error && (
+                            <span className="pipeline-stage-error">
+                              {detail.error}
+                            </span>
+                          )}
+                          {detail?.updated_at && (
+                            <span className="pipeline-stage-time">
+                              Updated{" "}
+                              {new Date(detail.updated_at).toLocaleTimeString(
+                                [],
+                                { hour: "2-digit", minute: "2-digit" }
+                              )}
+                            </span>
+                          )}
+                        </div>
+                        <span className="pipeline-stage-state">
+                          {stateLabel}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
               {pipelineStatus.status === "failed" &&
                 pipelineStatus.error_message && (
                   <p className="pipeline-error">
@@ -921,156 +1326,231 @@ function App() {
                   </p>
                 )}
 
-              {(pipelineStatus.status === "completed" ||
-                pipelineStatus.status === "completed_with_warnings") && (
+              {pipelineStatus.status === "completed" && (
                 <p className="pipeline-success">
-                  {pipelineStatus.status === "completed_with_warnings"
-                    ? "Processing finished, but some stages reported warnings. Your available scenes and outputs have been refreshed below."
-                    : "Your scenes and generated outputs have been refreshed below."}
+                  Processing is complete. Your scenes and generated Shorts are ready to review.
+                </p>
+              )}
+
+              {pipelineStatus.status === "completed_with_warnings" && (
+                <p className="pipeline-success">
+                  Processing finished. Some steps reported warnings; review the activity above and check your available results.
                 </p>
               )}
             </div>
           )}
         </section>
 
-        <section className="video-section">
-          <div className="section-heading">
-            <div>
-              <div className="eyebrow">YOUR VIDEO</div>
-              <h3>{video?.original_filename || "Loading video..."}</h3>
-              <p>Review your video and explore its detected scenes.</p>
+
+
+          </>
+        )}
+
+        {activeSection === "original-content" && (
+          <section className="home-library" id="original-content">
+            <div className="section-heading">
+              <div>
+                <div className="eyebrow">YOUR SOURCE LIBRARY</div>
+                <h3>Original Content</h3>
+                <p>All your imported original videos, organized in one place.</p>
+              </div>
+              <span className="video-tag">
+                {videos.length} {videos.length === 1 ? "VIDEO" : "VIDEOS"}
+              </span>
             </div>
 
-            <div className="video-controls">
-              <label className="video-selector">
-                <span>SELECT VIDEO</span>
-
-                <select
-                  value={selectedVideoId ?? ""}
-                  onChange={(event) =>
-                    setSelectedVideoId(Number(event.target.value))
-                  }
-                  disabled={videos.length === 0}
+            {loading && videos.length === 0 ? (
+              <div className="loading-state">Loading original videos...</div>
+            ) : videos.length === 0 ? (
+              <div className="home-library-empty">
+                <div className="home-library-empty-icon">＋</div>
+                <strong>No original videos yet</strong>
+                <p>Import a video to build your source library.</p>
+                <button
+                  type="button"
+                  className="home-video-open"
+                  onClick={() => setActiveSection("video-library")}
                 >
-                  {videos.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      #{item.id} · {item.original_filename}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <div className="video-tag">
-                VIDEO #{selectedVideoId ?? "—"}
+                  Import a video →
+                </button>
               </div>
-            </div>
-          </div>
-
-          <div className="video-layout">
-            <div className="player-card">
-              <div className="player-frame">
-                <video
-                  ref={videoRef}
-                  controls
-                  preload="metadata"
-                  src={
-                    selectedVideoId !== null
-                      ? `/api/videos/${selectedVideoId}/stream`
-                      : undefined
-                  }
-                />
+            ) : (
+              <div className="home-video-grid">
+                {videos.map((item) => (
+                  <article className="home-video-card" key={item.id}>
+                    <div className="home-video-art">
+                      <img
+                        className="home-video-thumbnail"
+                        src={`/api/videos/${item.id}/thumbnail`}
+                        alt=""
+                        loading="lazy"
+                        onError={(event) => {
+                          event.currentTarget.style.display = "none";
+                        }}
+                      />
+                      <span className="home-video-number">VIDEO #{item.id}</span>
+                      <span className="home-video-play">▶</span>
+                      <span className="home-video-duration">{formatTime(item.duration)}</span>
+                    </div>
+                    <div className="home-video-details">
+                      <h4 title={item.original_filename}>{item.original_filename}</h4>
+                      <div className="home-video-meta">
+                        <span>{item.width} × {item.height}</span>
+                        <span>{formatSize(item.file_size)}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="home-video-open"
+                        onClick={() => {
+                          setSelectedVideoId(item.id);
+                          setActiveSection("scene-library");
+                        }}
+                      >
+                        Open original video <span>→</span>
+                      </button>
+                    </div>
+                  </article>
+                ))}
               </div>
+            )}
+          </section>
+        )}
 
-              <div className="player-footer">
-                <div>
-                  <strong>
-                    {currentScene
-                      ? `Scene ${currentScene.scene_number}`
-                      : "Video preview"}
-                  </strong>
-
-                  <span>
-                    {currentScene
-                      ? `${formatTime(currentScene.start_time)} – ${formatTime(
-                          currentScene.end_time
-                        )}`
-                      : "Select a scene to jump to that moment."}
-                  </span>
-                </div>
-
-                <span className="quality-tag">
-                  {video ? `${video.width} × ${video.height}` : "—"}
-                </span>
-              </div>
-            </div>
-
-            <div className="video-info-card">
-              <div className="eyebrow">VIDEO INFORMATION</div>
-
-              <div className="info-row">
-                <span>Duration</span>
-                <strong>{video ? formatTime(video.duration) : "—"}</strong>
-              </div>
-
-              <div className="info-row">
-                <span>Resolution</span>
-                <strong>
-                  {video ? `${video.width} × ${video.height}` : "—"}
-                </strong>
-              </div>
-
-              <div className="info-row">
-                <span>Frame rate</span>
-                <strong>{video?.frame_rate || "—"}</strong>
-              </div>
-
-              <div className="info-row">
-                <span>File size</span>
-                <strong>{video ? formatSize(video.file_size) : "—"}</strong>
-              </div>
-
-              <div className="info-row">
-                <span>Audio</span>
-                <strong>
-                  {video ? (video.has_audio ? "Available" : "None") : "—"}
-                </strong>
-              </div>
-
-              <div className="info-row">
-                <span>Detected scenes</span>
-                <strong>{totalScenes.toLocaleString()}</strong>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section className="clips-section">
+        {activeSection === "my-shorts" && (
+        <section className="clips-section" id="my-shorts">
           <div className="section-heading">
             <div>
               <div className="eyebrow">YOUR GENERATED OUTPUTS</div>
-              <h3>Generated Clips</h3>
+              <h3>{shortsSourceVideo ? shortsSourceVideo.original_filename : "My Shorts"}</h3>
               <p>
-                Preview and download your review clips and finished outputs.
+                {shortsSourceVideo
+                  ? "Original video and all Shorts generated from this source."
+                  : "Choose an original video to view its generated Shorts."}
               </p>
             </div>
 
+            {shortsSourceVideo && (
+              <button
+                type="button"
+                className="home-video-open"
+                onClick={() => setSelectedShortsVideoId(null)}
+              >
+                ← Back to My Shorts
+              </button>
+            )}
+
             <div className="video-tag">
-              {clips.length} {clips.length === 1 ? "CANDIDATE" : "CANDIDATES"}
+              {videos.reduce(
+                (total, item) => total + (clipsByVideo[item.id]?.length ?? 0),
+                0
+              )} GENERATED CLIPS
             </div>
           </div>
 
-          {clipLoading ? (
-            <div className="loading-state">Loading generated clips...</div>
-          ) : clipError ? (
-            <div className="loading-state">{clipError}</div>
-          ) : clips.length === 0 ? (
+          {clipGroupsLoading ? (
+            <div className="loading-state">Loading your Shorts collection...</div>
+          ) : videos.length === 0 ? (
             <div className="loading-state">
-              No generated clips for this video yet. Generated outputs will
-              appear here after the pipeline finishes.
+              No uploaded videos yet. Import a video to start creating Shorts.
+            </div>
+          ) : selectedShortsVideoId === null ? (
+            <div className="home-video-grid">
+              {videos.map((item) => {
+                const sourceClips = clipsByVideo[item.id] ?? [];
+
+                return (
+                  <article className="home-video-card" key={item.id}>
+                    <div className="home-video-art">
+                      <img
+                        className="home-video-thumbnail"
+                        src={`/api/videos/${item.id}/thumbnail`}
+                        alt=""
+                        loading="lazy"
+                        onError={(event) => {
+                          event.currentTarget.style.display = "none";
+                        }}
+                      />
+                      <span className="home-video-number">SOURCE VIDEO #{item.id}</span>
+                      <span className="home-video-play">▶</span>
+                      <span className="home-video-duration">{formatTime(item.duration)}</span>
+                    </div>
+                    <div className="home-video-details">
+                      <h4 title={item.original_filename}>{item.original_filename}</h4>
+                      <div className="home-video-meta">
+                        <span>{sourceClips.length} generated {sourceClips.length === 1 ? "Short" : "Shorts"}</span>
+                        <span>{formatSize(item.file_size)}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="home-video-open"
+                        onClick={() => setSelectedShortsVideoId(item.id)}
+                      >
+                        Open this video's Shorts <span>→</span>
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           ) : (
-            <div className="clips-grid">
-              {clips.map((clip) => {
+            <>
+              {shortsSourceVideo && (
+                <div className="shorts-source-player">
+                  <div className="eyebrow">ORIGINAL SOURCE VIDEO</div>
+                  <div className="player-card">
+                    <div className="player-frame">
+                      <video
+                        controls
+                        preload="metadata"
+                        src={`/api/videos/${shortsSourceVideo.id}/stream`}
+                      />
+                    </div>
+                    <div className="player-footer">
+                      <div>
+                        <strong>{shortsSourceVideo.original_filename}</strong>
+                        <span>
+                          {formatTime(shortsSourceVideo.duration)} ·{" "}
+                          {shortsSourceVideo.width} × {shortsSourceVideo.height} ·{" "}
+                          {formatSize(shortsSourceVideo.file_size)}
+                        </span>
+                      </div>
+                      <span className="quality-tag">ORIGINAL</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="shorts-video-groups">
+              {videos.filter((item) => item.id === selectedShortsVideoId).map((sourceVideo) => {
+                const sourceClips = clipsByVideo[sourceVideo.id] ?? [];
+
+                return (
+                  <section className="shorts-video-group" key={sourceVideo.id}>
+                    <div className="shorts-video-group-heading">
+                      <div>
+                        <div className="eyebrow">
+                          SOURCE VIDEO · VIDEO #{sourceVideo.id}
+                        </div>
+                        <h4>{sourceVideo.original_filename}</h4>
+                        <p>
+                          {formatTime(sourceVideo.duration)} ·{" "}
+                          {sourceVideo.width} × {sourceVideo.height} ·{" "}
+                          {formatSize(sourceVideo.file_size)}
+                        </p>
+                      </div>
+                      <span className="video-tag">
+                        {sourceClips.length}{" "}
+                        {sourceClips.length === 1 ? "CLIP" : "CLIPS"}
+                      </span>
+                    </div>
+
+                    {sourceClips.length === 0 ? (
+                      <div className="loading-state">
+                        No generated clips from this video yet.
+                      </div>
+                    ) : (
+                      <div className="clips-grid">
+                        {sourceClips.map((clip) => {
                 const output = clip.shorts ?? clip.full;
 
                 const outputLabel = clip.shorts
@@ -1172,7 +1652,7 @@ function App() {
                               type="button"
                               className="metadata-generate"
                               disabled={metadataGeneratingId !== null}
-                              onClick={() => generateClipMetadata(clip.candidate_id)}
+                              onClick={() => generateClipMetadata(sourceVideo.id, clip.candidate_id)}
                             >
                               {metadataGeneratingId === clip.candidate_id
                                 ? "Generating..."
@@ -1288,7 +1768,7 @@ function App() {
                                 !metadataDraft.title.trim() ||
                                 !metadataDraft.description.trim()
                               }
-                              onClick={() => saveClipMetadata(clip.candidate_id)}
+                              onClick={() => saveClipMetadata(sourceVideo.id, clip.candidate_id)}
                             >
                               {metadataSavingId === clip.candidate_id
                                 ? "Saving..."
@@ -1306,12 +1786,20 @@ function App() {
 
                   </article>
                 );
+                        })}
+                      </div>
+                    )}
+                  </section>
+                );
               })}
-            </div>
+              </div>
+            </>
           )}
         </section>
+        )}
 
-        <section className="scenes-section">
+        {activeSection === "scene-library" && (
+        <section className="scenes-section" id="scene-library">
           <div className="scenes-heading">
             <div>
               <div className="eyebrow">VIDEO BREAKDOWN</div>
@@ -1464,6 +1952,7 @@ function App() {
             </button>
           </div>
         </section>
+        )}
 
         <footer className="footer">
           <span>SatisfyingAI · Local AI Video Studio</span>

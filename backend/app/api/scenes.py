@@ -472,3 +472,55 @@ def scene_thumbnail(
         thumbnail_path,
         media_type="image/jpeg",
     )
+
+@router.get("/{video_id}/thumbnail")
+def video_thumbnail(
+    video_id: int,
+    db: Session = Depends(get_db),
+):
+    """Serve the original thumbnail from this video's own storage folder."""
+    video = db.get(Video, video_id)
+
+    if video is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Video not found.",
+        )
+
+    if not video.thumbnail_path:
+        raise HTTPException(
+            status_code=404,
+            detail="Video thumbnail has not been generated.",
+        )
+
+    try:
+        thumbnail_path = resolve_video_storage_path(
+            video_id,
+            video.thumbnail_path,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid video thumbnail path.",
+        ) from error
+
+    expected_path = (
+        get_video_storage_paths(video_id)["upload_thumbnail"].resolve()
+    )
+
+    if thumbnail_path != expected_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Thumbnail must be the original upload thumbnail.",
+        )
+
+    if not thumbnail_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Video thumbnail file is missing.",
+        )
+
+    return FileResponse(
+        thumbnail_path,
+        media_type="image/jpeg",
+    )

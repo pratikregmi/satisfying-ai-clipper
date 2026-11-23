@@ -58,3 +58,18 @@ backups/
 *.db
 *.sqlite
 *.sqlite3
+
+# Nested environments, dependencies, caches, and build output
+**/venv/
+**/.venv/
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/dist/
+**/build/
+
+# Local diagnostic references and temporary backups
+/cmd.txt
+*.before_*

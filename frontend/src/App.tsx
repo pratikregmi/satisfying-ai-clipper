@@ -57,11 +57,31 @@ type GeneratedClipFile = {
   size_bytes: number;
 };
 
+type ClipMetadata = {
+  id: number;
+  candidate_id: number;
+  title: string;
+  description: string;
+  hashtags: string[];
+  status: "pending" | "generating" | "completed" | "failed";
+  model_name: string | null;
+  error_message: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+type ClipMetadataDraft = {
+  title: string;
+  description: string;
+  hashtags: string;
+};
+
 type GeneratedClip = {
   candidate_id: number;
   review: GeneratedClipFile | null;
   shorts: GeneratedClipFile | null;
   full: GeneratedClipFile | null;
+  metadata: ClipMetadata | null;
 };
 
 type GeneratedClipsResponse = {
@@ -135,6 +155,14 @@ function App() {
   const [clips, setClips] = useState<GeneratedClip[]>([]);
   const [clipLoading, setClipLoading] = useState(false);
   const [clipError, setClipError] = useState("");
+  const [metadataDrafts, setMetadataDrafts] = useState<
+    Record<number, ClipMetadataDraft>
+  >({});
+  const [metadataGeneratingId, setMetadataGeneratingId] = useState<number | null>(null);
+  const [metadataSavingId, setMetadataSavingId] = useState<number | null>(null);
+  const [metadataMessages, setMetadataMessages] = useState<
+    Record<number, string>
+  >({});
 
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceName, setSourceName] = useState("");
@@ -234,7 +262,22 @@ function App() {
 
       const data: GeneratedClipsResponse = await response.json();
 
-      setClips(data.clips ?? []);
+      const loadedClips = data.clips ?? [];
+      setClips(loadedClips);
+
+      setMetadataDrafts(
+        Object.fromEntries(
+          loadedClips.map((clip) => [
+            clip.candidate_id,
+            {
+              title: clip.metadata?.title ?? "",
+              description: clip.metadata?.description ?? "",
+              hashtags: clip.metadata?.hashtags.join(" ") ?? "",
+            },
+          ])
+        )
+      );
+      setMetadataMessages({});
     } catch (err) {
       setClips([]);
       setClipError(
@@ -244,6 +287,175 @@ function App() {
       setClipLoading(false);
     }
   }, []);
+
+  const generateClipMetadata = async (candidateId: number) => {
+    if (selectedVideoId === null || metadataGeneratingId !== null) return;
+
+    setMetadataGeneratingId(candidateId);
+    setMetadataMessages((current) => ({
+      ...current,
+      [candidateId]: "Generating metadata with AI...",
+    }));
+
+    try {
+      const response = await fetch(
+        `/api/videos/${selectedVideoId}/clips/${candidateId}/metadata/generate`,
+        { method: "POST" }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Metadata generation failed.");
+      }
+
+      const metadata = data as ClipMetadata;
+
+      if (metadata.status !== "completed") {
+        throw new Error(
+          metadata.error_message || "AI could not generate metadata."
+        );
+      }
+
+      setClips((current) =>
+        current.map((clip) =>
+          clip.candidate_id === candidateId
+            ? { ...clip, metadata }
+            : clip
+        )
+      );
+
+      setMetadataDrafts((current) => ({
+        ...current,
+        [candidateId]: {
+          title: metadata.title,
+          description: metadata.description,
+          hashtags: metadata.hashtags.join(" "),
+        },
+      }));
+
+      setMetadataMessages((current) => ({
+        ...current,
+        [candidateId]: "Metadata generated successfully. Review and save your changes.",
+      }));
+    } catch (err) {
+      setMetadataMessages((current) => ({
+        ...current,
+        [candidateId]:
+          err instanceof Error ? err.message : "Metadata generation failed.",
+      }));
+    } finally {
+      setMetadataGeneratingId(null);
+    }
+  };
+
+  const saveClipMetadata = async (candidateId: number) => {
+    if (selectedVideoId === null || metadataSavingId !== null) return;
+
+    const draft = metadataDrafts[candidateId];
+
+    if (!draft) return;
+
+    const hashtags = draft.hashtags
+      .split(/[\\s,]+/)
+      .map((tag) => tag.trim().replace(/^#+/, ""))
+      .filter(Boolean);
+
+    if (!draft.title.trim() || !draft.description.trim()) {
+      setMetadataMessages((current) => ({
+        ...current,
+        [candidateId]: "Title and description cannot be empty.",
+      }));
+      return;
+    }
+
+    if (hashtags.length < 3 || hashtags.length > 8) {
+      setMetadataMessages((current) => ({
+        ...current,
+        [candidateId]: "Please provide between 3 and 8 hashtags.",
+      }));
+      return;
+    }
+
+    setMetadataSavingId(candidateId);
+    setMetadataMessages((current) => ({
+      ...current,
+      [candidateId]: "Saving metadata...",
+    }));
+
+    try {
+      const response = await fetch(
+        `/api/videos/${selectedVideoId}/clips/${candidateId}/metadata`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: draft.title.trim(),
+            description: draft.description.trim(),
+            hashtags,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not save metadata.");
+      }
+
+      const metadata = data as ClipMetadata;
+
+      setClips((current) =>
+        current.map((clip) =>
+          clip.candidate_id === candidateId
+            ? { ...clip, metadata }
+            : clip
+        )
+      );
+
+      setMetadataDrafts((current) => ({
+        ...current,
+        [candidateId]: {
+          title: metadata.title,
+          description: metadata.description,
+          hashtags: metadata.hashtags.join(" "),
+        },
+      }));
+
+      setMetadataMessages((current) => ({
+        ...current,
+        [candidateId]: "Metadata saved successfully.",
+      }));
+    } catch (err) {
+      setMetadataMessages((current) => ({
+        ...current,
+        [candidateId]:
+          err instanceof Error ? err.message : "Could not save metadata.",
+      }));
+    } finally {
+      setMetadataSavingId(null);
+    }
+  };
+
+  const copyMetadata = async (
+    candidateId: number,
+    label: string,
+    value: string
+  ) => {
+    try {
+      await navigator.clipboard.writeText(value);
+
+      setMetadataMessages((current) => ({
+        ...current,
+        [candidateId]: `${label} copied to clipboard.`,
+      }));
+    } catch {
+      setMetadataMessages((current) => ({
+        ...current,
+        [candidateId]: "Clipboard access failed. Please copy the text manually.",
+      }));
+    }
+  };
 
   const submitVideoUrl = async () => {
     if (ingesting) return;
@@ -867,6 +1079,12 @@ function App() {
                     ? "Full-screen output"
                     : "Output not generated";
 
+                const metadataDraft = metadataDrafts[clip.candidate_id] ?? {
+                  title: "",
+                  description: "",
+                  hashtags: "",
+                };
+
                 return (
                   <article className="clip-card" key={clip.candidate_id}>
                     <div className="clip-card-heading">
@@ -933,11 +1151,159 @@ function App() {
                       )}
 
                       {!output && (
-                        <div className="clip-output-pending">
-                          The finished output has not been generated yet.
+                          <div className="clip-output-pending">
+                            The finished output has not been generated yet.
+                          </div>
+                        )}
+                      </div>
+
+                      {clip.shorts && (
+                        <div className="metadata-editor">
+                          <div className="metadata-heading">
+                            <div>
+                              <strong>ChaosReel · YouTube Metadata</strong>
+                              <span>
+                                {clip.metadata?.status === "completed"
+                                  ? "Saved metadata available"
+                                  : "Generate metadata for this Short"}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              className="metadata-generate"
+                              disabled={metadataGeneratingId !== null}
+                              onClick={() => generateClipMetadata(clip.candidate_id)}
+                            >
+                              {metadataGeneratingId === clip.candidate_id
+                                ? "Generating..."
+                                : clip.metadata
+                                  ? "Regenerate with AI"
+                                  : "Generate with AI"}
+                            </button>
+                          </div>
+
+                          <label className="metadata-field">
+                            Title
+                            <input
+                              value={metadataDraft.title}
+                              maxLength={255}
+                              placeholder="Generate or enter a Short title"
+                              onChange={(event) =>
+                                setMetadataDrafts((current) => ({
+                                  ...current,
+                                  [clip.candidate_id]: {
+                                    ...metadataDraft,
+                                    title: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                          </label>
+                          <div className="metadata-copy-row">
+                            <button
+                              type="button"
+                              disabled={!metadataDraft.title.trim()}
+                              onClick={() =>
+                                copyMetadata(clip.candidate_id, "Title", metadataDraft.title)
+                              }
+                            >
+                              Copy title
+                            </button>
+                          </div>
+
+                          <label className="metadata-field">
+                            Description
+                            <textarea
+                              rows={4}
+                              value={metadataDraft.description}
+                              placeholder="Describe the actual moment in this Short"
+                              onChange={(event) =>
+                                setMetadataDrafts((current) => ({
+                                  ...current,
+                                  [clip.candidate_id]: {
+                                    ...metadataDraft,
+                                    description: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                          </label>
+                          <div className="metadata-copy-row">
+                            <button
+                              type="button"
+                              disabled={!metadataDraft.description.trim()}
+                              onClick={() =>
+                                copyMetadata(
+                                  clip.candidate_id,
+                                  "Description",
+                                  metadataDraft.description
+                                )
+                              }
+                            >
+                              Copy description
+                            </button>
+                          </div>
+
+                          <label className="metadata-field">
+                            Hashtags
+                            <input
+                              value={metadataDraft.hashtags}
+                              placeholder="ChaosReel GamingMoments Shorts"
+                              onChange={(event) =>
+                                setMetadataDrafts((current) => ({
+                                  ...current,
+                                  [clip.candidate_id]: {
+                                    ...metadataDraft,
+                                    hashtags: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                            <span>Separate 3–8 hashtags with spaces or commas.</span>
+                          </label>
+
+                          <div className="metadata-actions">
+                            <button
+                              type="button"
+                              disabled={!metadataDraft.hashtags.trim()}
+                              onClick={() =>
+                                copyMetadata(
+                                  clip.candidate_id,
+                                  "Hashtags",
+                                  metadataDraft.hashtags
+                                    .split(/[\\s,]+/)
+                                    .filter(Boolean)
+                                    .map((tag) => tag.startsWith("#") ? tag : `#${tag}`)
+                                    .join(" ")
+                                )
+                              }
+                            >
+                              Copy hashtags
+                            </button>
+                            <button
+                              type="button"
+                              className="metadata-save"
+                              disabled={
+                                metadataSavingId !== null ||
+                                !metadataDraft.title.trim() ||
+                                !metadataDraft.description.trim()
+                              }
+                              onClick={() => saveClipMetadata(clip.candidate_id)}
+                            >
+                              {metadataSavingId === clip.candidate_id
+                                ? "Saving..."
+                                : "Save changes"}
+                            </button>
+                          </div>
+
+                          {metadataMessages[clip.candidate_id] && (
+                            <p className="metadata-message" role="status">
+                              {metadataMessages[clip.candidate_id]}
+                            </p>
+                          )}
                         </div>
                       )}
-                    </div>
+
                   </article>
                 );
               })}

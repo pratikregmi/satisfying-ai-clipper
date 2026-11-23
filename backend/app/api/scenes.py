@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 from backend.app.core.database import PROJECT_ROOT, get_db
 from backend.app.models.video import Video
 from backend.app.models.scene import Scene
+from backend.app.models.clip_metadata import ClipMetadata
+from backend.app.services.clip_metadata_service import metadata_to_dict
 from backend.app.schemas.scene import SceneResponse
 from backend.app.services.scene_service import (
     detect_scenes,
@@ -343,6 +345,7 @@ def list_video_clips(
                 "review": None,
                 "shorts": None,
                 "full": None,
+                "metadata": None,
             },
         )
 
@@ -356,6 +359,25 @@ def list_video_clips(
         clips_by_candidate[candidate_id]
         for candidate_id in sorted(clips_by_candidate)
     ]
+
+    candidate_ids = list(clips_by_candidate)
+
+    if candidate_ids:
+        metadata_rows = db.scalars(
+            select(ClipMetadata).where(
+                ClipMetadata.candidate_id.in_(candidate_ids)
+            )
+        ).all()
+
+        metadata_by_candidate = {
+            row.candidate_id: metadata_to_dict(row)
+            for row in metadata_rows
+        }
+
+        for clip in clips:
+            clip["metadata"] = metadata_by_candidate.get(
+                clip["candidate_id"]
+            )
 
     return {
         "video_id": video_id,
